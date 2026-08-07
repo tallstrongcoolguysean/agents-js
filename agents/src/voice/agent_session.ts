@@ -10,7 +10,6 @@ import {
   type RemoteParticipant,
   type Room,
 } from '@livekit/rtc-node';
-import { ThrowsPromise } from '@livekit/throws-transformer/throws';
 import type { TypedEventEmitter as TypedEmitter } from '@livekit/typed-emitter';
 import type { Context, Span } from '@opentelemetry/api';
 import { context as otelContext, trace } from '@opentelemetry/api';
@@ -30,7 +29,7 @@ import {
   type TTSModelString,
 } from '../inference/index.js';
 import type { OverlappingSpeechEvent } from '../inference/interruption/types.js';
-import { getJobContext } from '../job.js';
+import { type JobContext, getJobContext } from '../job.js';
 import type { FunctionCall, FunctionCallOutput } from '../llm/chat_context.js';
 import {
   AgentHandoffItem,
@@ -801,7 +800,13 @@ export class AgentSession<
     // Initial start does not wait on onEnter
     tasks.push(this._updateActivity(this.agent, { waitOnEnter: false }));
 
-    await ThrowsPromise.allSettled(tasks);
+    const startupResults = await Promise.allSettled(tasks);
+    const failedStartup = startupResults.find(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
+    );
+    if (failedStartup) {
+      throw failedStartup.reason;
+    }
 
     if (this.sessionHost) {
       await this.sessionHost.start();
@@ -856,51 +861,56 @@ export class AgentSession<
 
     const ctx = getJobContext(false);
 
-    if (ctx) {
-      const recordIsGiven = record !== undefined;
-      if (record === undefined) {
-        // defer to the server-side setting for recording
-        record = ctx.job.enableRecording;
-      }
-
-      this._recordingOptions = resolveRecordingOptions(record);
-      if (this._textOnly) {
-        this._recordingOptions.audio = false;
-      }
-
-      // Only one AgentSession per job can be the primary (and therefore record).
-      // Designate the primary before initRecording so a demoted secondary session
-      // never configures cloud recording. Mirrors Python's start() ordering.
-      if (ctx._primaryAgentSession === undefined || ctx._primaryAgentSession === this) {
-        ctx._primaryAgentSession = this;
-      } else if (recordingEnabled(this._recordingOptions)) {
-        if (recordIsGiven) {
-          throw new Error(
-            'Only one `AgentSession` can be the primary at a time. If you want to ignore primary designation, use `session.start({ record: false })`.',
-          );
+    try {
+      if (ctx) {
+        const recordIsGiven = record !== undefined;
+        if (record === undefined) {
+          // defer to the server-side setting for recording
+          record = ctx.job.enableRecording;
         }
-        // record was not given: silently disable recording for the secondary session
-        this._recordingOptions = resolveRecordingOptions(false);
+
+        this._recordingOptions = resolveRecordingOptions(record);
+        if (this._textOnly) {
+          this._recordingOptions.audio = false;
+        }
+
+        // Only one AgentSession per job can be the primary (and therefore record).
+        // Designate the primary before initRecording so a demoted secondary session
+        // never configures cloud recording. Mirrors Python's start() ordering.
+        if (ctx._primaryAgentSession === undefined || ctx._primaryAgentSession === this) {
+          ctx._primaryAgentSession = this;
+        } else if (recordingEnabled(this._recordingOptions)) {
+          if (recordIsGiven) {
+            throw new Error(
+              'Only one `AgentSession` can be the primary at a time. If you want to ignore primary designation, use `session.start({ record: false })`.',
+            );
+          }
+          // record was not given: silently disable recording for the secondary session
+          this._recordingOptions = resolveRecordingOptions(false);
+        }
+
+        if (this._enableRecording) {
+          await ctx.initRecording(this._recordingOptions);
+        }
       }
 
-      if (this._enableRecording) {
-        await ctx.initRecording(this._recordingOptions);
-      }
+      this.sessionSpan = tracer.startSpan({
+        name: 'agent_session',
+      });
+
+      this.rootSpanContext = trace.setSpan(otelContext.active(), this.sessionSpan);
+
+      await this._startImpl({
+        agent,
+        room,
+        inputOptions,
+        outputOptions,
+        span: this.sessionSpan,
+      });
+    } catch (error) {
+      await this.cleanupFailedStart(ctx);
+      throw error;
     }
-
-    this.sessionSpan = tracer.startSpan({
-      name: 'agent_session',
-    });
-
-    this.rootSpanContext = trace.setSpan(otelContext.active(), this.sessionSpan);
-
-    await this._startImpl({
-      agent,
-      room,
-      inputOptions,
-      outputOptions,
-      span: this.sessionSpan,
-    });
   }
 
   updateAgent(agent: Agent): void {
@@ -1449,8 +1459,60 @@ export class AgentSession<
     return false;
   }
 
+  private async cleanupFailedStart(ctx: JobContext | undefined): Promise<void> {
+    this.closing = true;
+    this._cancelUserAwayTimer();
+    this._onAecWarmupExpired();
+    this.off(AgentSessionEventTypes.UserInputTranscribed, this._onUserInputTranscribed);
+
+    if (this.activity) {
+      try {
+        await this.activity.interrupt({ force: true }).await;
+      } catch (error) {
+        this.logger.debug({ error }, 'failed to interrupt partially started activity');
+      }
+      await this.activity.close().catch((error) => {
+        this.logger.debug({ error }, 'failed to close partially started activity');
+      });
+      this.activity = undefined;
+    }
+
+    await this._recorderIO?.close().catch((error) => {
+      this.logger.debug({ error }, 'failed to close recorder after session start failure');
+    });
+    this._recorderIO = undefined;
+
+    this.input.audio = null;
+    this.output.audio = null;
+    this.output.transcription = null;
+
+    await Promise.allSettled(this._toolCtx.toolsets.map((toolset) => toolset.aclose()));
+    await this.sessionHost?.close().catch((error) => {
+      this.logger.debug({ error }, 'failed to close session host after start failure');
+    });
+    this.sessionHost = undefined;
+    await this._roomIO?.close().catch((error) => {
+      this.logger.debug({ error }, 'failed to close room IO after session start failure');
+    });
+    this._roomIO = undefined;
+
+    this.sessionSpan?.end();
+    this.sessionSpan = undefined;
+    this._userSpeakingSpan?.end();
+    this._userSpeakingSpan = undefined;
+    this.agentSpeakingSpan?.end();
+    this.agentSpeakingSpan = undefined;
+    this.rootSpanContext = undefined;
+    this.started = false;
+
+    if (ctx?._primaryAgentSession === this) {
+      ctx._primaryAgentSession = undefined;
+    }
+    this.closing = false;
+  }
+
   async close(): Promise<void> {
-    await this.closeImpl(CloseReason.USER_INITIATED);
+    await this.startClose(CloseReason.USER_INITIATED);
   }
 
   shutdown(options?: { drain?: boolean; reason?: ShutdownReason }): void {
@@ -1472,11 +1534,8 @@ export class AgentSession<
     drain?: boolean;
     error?: RealtimeModelError | STTError | TTSError | LLMError | null;
   }): void {
-    if (this.closingTask) {
-      return;
-    }
-    this.closingTask = this.closeImpl(reason, error, drain).finally(() => {
-      this.closingTask = null;
+    void this.startClose(reason, error, drain).catch((closeError) => {
+      this.logger.error({ error: closeError, reason }, 'AgentSession close failed');
     });
   }
 
@@ -1501,11 +1560,27 @@ export class AgentSession<
 
     this.logger.error(error, 'AgentSession is closing due to an unrecoverable error');
 
-    this.closingTask = (async () => {
-      await this.closeImpl(CloseReason.ERROR, error);
-    })().then(() => {
-      this.closingTask = null;
+    void this.startClose(CloseReason.ERROR, error).catch((closeError) => {
+      this.logger.error({ error: closeError }, 'AgentSession error close failed');
     });
+  }
+
+  private startClose(
+    reason: ShutdownReason,
+    error: RealtimeModelError | LLMError | TTSError | STTError | null = null,
+    drain: boolean = false,
+  ): Promise<void> {
+    if (this.closingTask) {
+      return this.closingTask;
+    }
+
+    const task = this.closeImpl(reason, error, drain).finally(() => {
+      if (this.closingTask === task) {
+        this.closingTask = null;
+      }
+    });
+    this.closingTask = task;
+    return task;
   }
 
   /** @internal */
@@ -1738,17 +1813,17 @@ export class AgentSession<
     this.off(AgentSessionEventTypes.UserInputTranscribed, this._onUserInputTranscribed);
 
     if (this.activity) {
-      if (!drain) {
+      if (drain) {
+        await this.activity.drain();
+        // wait any uninterruptible speech to finish
+        await this.activity.currentSpeech?.waitForPlayout();
+      } else {
         try {
           await this.activity.interrupt({ force: true }).await;
         } catch (error) {
           this.logger.warn({ error }, 'Error interrupting activity');
         }
       }
-
-      await this.activity.drain();
-      // wait any uninterruptible speech to finish
-      await this.activity.currentSpeech?.waitForPlayout();
 
       if (reason !== CloseReason.ERROR) {
         this.activity.commitUserTurn({ audioDetached: true, throwIfNotReady: false });

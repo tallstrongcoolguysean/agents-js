@@ -1243,15 +1243,9 @@ export class RealtimeSession extends llm.RealtimeSession {
 
   private async runWs(wsConn: WebSocket): Promise<void> {
     const forwardEvents = async (signal: AbortSignal): Promise<void> => {
-      const abortFuture = new Future<void>();
-      signal.addEventListener('abort', () => abortFuture.resolve());
-
       while (!this.#closed && wsConn.readyState === WebSocket.OPEN && !signal.aborted) {
         try {
-          const event = await Promise.race([this.messageChannel.get(), abortFuture.await]);
-          if (signal.aborted || abortFuture.done || event === undefined) {
-            break;
-          }
+          const event = await this.messageChannel.get({ signal });
 
           if (lkOaiDebug) {
             this.#logger.debug(this.loggableEvent(event), `(client) -> ${event.type}`);

@@ -9,6 +9,7 @@ import {
   createTimedString,
   log,
   normalizeLanguage,
+  raceWithAbort,
   stt,
 } from '@livekit/agents';
 import type { AudioFrame } from '@livekit/rtc-node';
@@ -338,15 +339,25 @@ class SpeechStreamv2 extends stt.SpeechStream {
         });
 
         // 2. Run Concurrent Tasks (Send & Receive)
-        const sendPromise = this.#sendTask();
+        const reconnectController = new AbortController();
+        const sendPromise = this.#sendTask(reconnectController.signal);
         const recvPromise = this.#recvTask();
-        const reconnectWait = this.#reconnectEvent.wait();
+        const reconnectWait = this.#reconnectEvent.wait({
+          signal: reconnectController.signal,
+        });
 
         // 3. Race: Normal Completion vs Reconnect Signal
-        const result = await Promise.race([
-          Promise.all([sendPromise, recvPromise]),
-          reconnectWait.then(() => 'RECONNECT'),
-        ]);
+        let result: [void, void] | 'RECONNECT';
+        try {
+          result = await Promise.race([
+            Promise.all([sendPromise, recvPromise]),
+            reconnectWait.then((reconnect) =>
+              reconnect ? ('RECONNECT' as const) : new Promise<never>(() => {}),
+            ),
+          ]);
+        } finally {
+          reconnectController.abort();
+        }
 
         if (result === 'RECONNECT') {
           this.#logger.debug('Reconnecting stream due to option update...');
@@ -368,7 +379,7 @@ class SpeechStreamv2 extends stt.SpeechStream {
     this.close();
   }
 
-  async #sendTask() {
+  async #sendTask(reconnectSignal: AbortSignal) {
     if (!this.#ws) return;
 
     // Buffer audio into 50ms chunks (Parity)
@@ -382,15 +393,11 @@ class SpeechStreamv2 extends stt.SpeechStream {
     const iterator = this.input[Symbol.asyncIterator]();
 
     while (true) {
-      const nextPromise = iterator.next();
-      // If reconnect signal fires, abort the wait
-      const abortPromise = this.#reconnectEvent.wait().then(() => ({ abort: true }) as const);
-
-      const result = await Promise.race([nextPromise, abortPromise]);
+      const result = await raceWithAbort(iterator.next(), reconnectSignal);
 
       // Check if we need to abort (Reconnect) or if stream is done
-      if ('abort' in result || result.done) {
-        if (!('abort' in result) && result.done) {
+      if (!result || result.done) {
+        if (result?.done) {
           // Normal stream end
           hasEnded = true;
           inputEnded = true;
@@ -403,7 +410,7 @@ class SpeechStreamv2 extends stt.SpeechStream {
       // If we broke above, we don't process data. If not, 'result' is IteratorResult
       if (hasEnded && result.value === undefined) {
         // Process flush below
-      } else if ('value' in result) {
+      } else {
         const data = result.value;
         const frames: AudioFrame[] = [];
 

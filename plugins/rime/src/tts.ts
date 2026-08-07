@@ -13,6 +13,7 @@ import {
   asError,
   createTimedString,
   log,
+  raceWithAbort,
   shortuuid,
   stream,
   tokenize,
@@ -377,9 +378,10 @@ export class SynthesizeStream extends tts.SynthesizeStream {
     const contextId = shortuuid();
     const bstream = new AudioByteStream(getSampleRate(this.#opts), RIME_TTS_CHANNELS);
     const messageChannel = stream.createStreamChannel<Record<string, unknown>>();
-    const errorFuture = new Future<Error>();
+    const socketAbortController = new AbortController();
     const inputSentFuture = new Future<void>();
     let emptyInput = false;
+    let socketError: Error | undefined;
     let ws: WebSocket | undefined;
 
     const inputTask = async () => {
@@ -441,11 +443,12 @@ export class SynthesizeStream extends tts.SynthesizeStream {
       const reader = messageChannel.stream().getReader();
       try {
         while (!this.closed && !this.abortSignal.aborted) {
-          const [result, socketError] = await Promise.race([
-            reader.read().then((result) => [result, undefined] as const),
-            errorFuture.await.then((error) => [undefined, error] as const),
-          ]);
-          if (socketError) throw socketError;
+          const result = await raceWithAbort(
+            reader.read(),
+            this.abortSignal,
+            socketAbortController.signal,
+          );
+          if (!result && socketError) throw socketError;
           if (!result || result.done) break;
 
           const data = result.value;
@@ -502,17 +505,17 @@ export class SynthesizeStream extends tts.SynthesizeStream {
     };
     const onClose = (code: number, reason: Buffer) => {
       if (!this.abortSignal.aborted) {
-        errorFuture.resolve(
-          new APIStatusError({
-            message: `Rime ws closed unexpectedly: ${reason.toString()}`,
-            options: { statusCode: code },
-          }),
-        );
+        socketError = new APIStatusError({
+          message: `Rime ws closed unexpectedly: ${reason.toString()}`,
+          options: { statusCode: code },
+        });
       }
+      socketAbortController.abort();
       void messageChannel.close();
     };
     const onError = (error: Error) => {
-      errorFuture.resolve(error);
+      socketError = error;
+      socketAbortController.abort();
       void messageChannel.close();
     };
 

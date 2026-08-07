@@ -10,8 +10,8 @@ import {
   getBaseLanguage,
   log,
   normalizeLanguage,
+  raceWithAbort,
   stt,
-  waitForAbort,
 } from '@livekit/agents';
 import type { AudioFrame } from '@livekit/rtc-node';
 import type { IncomingMessage } from 'node:http';
@@ -376,10 +376,9 @@ export class SpeechStream extends stt.SpeechStream {
 
     let hasEnded = false;
     const iterator = this.input[Symbol.asyncIterator]();
-    const abortPromise = waitForAbort(abortSignal);
 
     while (true) {
-      const result = await Promise.race([iterator.next(), abortPromise]);
+      const result = await raceWithAbort(iterator.next(), abortSignal);
 
       if (result === undefined) return; // aborted
 

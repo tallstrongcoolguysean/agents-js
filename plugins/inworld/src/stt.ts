@@ -11,6 +11,7 @@ import {
   log,
   mergeFrames,
   normalizeLanguage,
+  raceWithAbort,
   shortuuid,
   stt,
   waitForAbort,
@@ -337,11 +338,9 @@ export class SpeechStream extends stt.SpeechStream {
         samples100Ms,
       );
 
-      const abortPromise = waitForAbort(this.abortSignal);
-
       try {
         while (!this.closed) {
-          const result = await Promise.race([this.input.next(), abortPromise]);
+          const result = await raceWithAbort(this.input.next(), this.abortSignal);
 
           if (result === undefined) return;
           if (result.done) break;

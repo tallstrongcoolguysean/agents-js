@@ -85,6 +85,90 @@ describe('AgentSession.run', () => {
   });
 });
 
+describe('AgentSession close lifecycle', () => {
+  function createStartedSession() {
+    const session = new AgentSession({ vad: null });
+    const activity = {
+      interrupt: vi.fn(() => ({ await: Promise.resolve() })),
+      drain: vi.fn(async () => {}),
+      currentSpeech: undefined,
+      commitUserTurn: vi.fn(),
+      detachAudioInput: vi.fn(),
+      close: vi.fn(async () => {}),
+    };
+    const internals = session as unknown as {
+      started: boolean;
+      activity: typeof activity | undefined;
+      closingTask: Promise<void> | null;
+    };
+    internals.started = true;
+    internals.activity = activity;
+    return { session, activity, internals };
+  }
+
+  it('deduplicates concurrent direct close calls', async () => {
+    const { session, activity } = createStartedSession();
+
+    await Promise.all([session.close(), session.close()]);
+
+    expect(activity.interrupt).toHaveBeenCalledTimes(1);
+    expect(activity.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not gracefully drain during a forced close', async () => {
+    const { session, activity } = createStartedSession();
+
+    await session.close();
+
+    expect(activity.interrupt).toHaveBeenCalledWith({ force: true });
+    expect(activity.drain).not.toHaveBeenCalled();
+  });
+
+  it('preserves graceful draining when explicitly requested', async () => {
+    const { session, activity, internals } = createStartedSession();
+
+    session.shutdown({ drain: true });
+    await internals.closingTask;
+
+    expect(activity.interrupt).not.toHaveBeenCalled();
+    expect(activity.drain).toHaveBeenCalledTimes(1);
+  });
+
+  it('cleans resources and releases primary designation after startup failure', async () => {
+    const session = new AgentSession({ vad: null });
+    const activity = {
+      interrupt: vi.fn(() => ({ await: Promise.resolve() })),
+      close: vi.fn(async () => {}),
+    };
+    const recorder = { close: vi.fn(async () => {}) };
+    const sessionHost = { close: vi.fn(async () => {}) };
+    const roomIO = { close: vi.fn(async () => {}) };
+    const ctx = { _primaryAgentSession: session };
+    const internals = session as unknown as {
+      activity: typeof activity | undefined;
+      _recorderIO: typeof recorder | undefined;
+      sessionHost: typeof sessionHost | undefined;
+      _roomIO: typeof roomIO | undefined;
+      started: boolean;
+      cleanupFailedStart: (context: typeof ctx) => Promise<void>;
+    };
+    internals.activity = activity;
+    internals._recorderIO = recorder;
+    internals.sessionHost = sessionHost;
+    internals._roomIO = roomIO;
+
+    await internals.cleanupFailedStart(ctx);
+
+    expect(activity.interrupt).toHaveBeenCalledWith({ force: true });
+    expect(activity.close).toHaveBeenCalledTimes(1);
+    expect(recorder.close).toHaveBeenCalledTimes(1);
+    expect(sessionHost.close).toHaveBeenCalledTimes(1);
+    expect(roomIO.close).toHaveBeenCalledTimes(1);
+    expect(ctx._primaryAgentSession).toBeUndefined();
+    expect(internals.started).toBe(false);
+  });
+});
+
 describe('resolveRecordingOptions', () => {
   it('treats a boolean as all-on or all-off', () => {
     expect(resolveRecordingOptions(true)).toEqual({

@@ -28,6 +28,7 @@ import { type AgentSession } from '../agent_session.js';
 import {
   AgentSessionEventTypes,
   type AgentStateChangedEvent,
+  type CloseEvent,
   CloseReason,
   type ConversationItemAddedEvent,
   type UserInputTranscribedEvent,
@@ -302,7 +303,14 @@ export class RoomIO {
     this.transcriptionSynchronizer.enabled = !nativeTranscriptSync;
   };
 
-  private onAgentSessionClose = () => {
+  private onAgentSessionClose = (event: CloseEvent) => {
+    if (event.reason === CloseReason.PARTICIPANT_DISCONNECTED) {
+      const jobContext = this.jobContext ?? getJobContext(false);
+      if (jobContext?._primaryAgentSession === this.agentSession) {
+        jobContext.shutdown('primary participant disconnected');
+      }
+    }
+
     if (!this.inputOptions.deleteRoomOnClose || this.deleteRoomTask) {
       return;
     }

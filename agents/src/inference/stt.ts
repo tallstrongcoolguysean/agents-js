@@ -17,7 +17,15 @@ import {
   SpeechEventType,
 } from '../stt/index.js';
 import { type APIConnectOptions, DEFAULT_API_CONNECT_OPTIONS } from '../types.js';
-import { type AudioBuffer, Event, Task, cancelAndWait, shortuuid, waitForAbort } from '../utils.js';
+import {
+  type AudioBuffer,
+  Event,
+  Task,
+  cancelAndWait,
+  raceWithAbort,
+  shortuuid,
+  waitForAbort,
+} from '../utils.js';
 import { type VAD, VADEventType, type VADStream } from '../vad.js';
 import { type TimedString, createTimedString } from '../voice/io.js';
 import {
@@ -858,21 +866,13 @@ export class SpeechStream<TModel extends STTModels> extends BaseSpeechStream {
           Math.floor(this.opts.sampleRate / 20), // 50ms
         );
 
-        // Create abort promise once to avoid memory leak
-        const abortPromise = new ThrowsPromise<never, Error>((_, reject) => {
-          if (signal.aborted) {
-            return reject(new Error('Send aborted'));
-          }
-          const onAbort = () => reject(new Error('Send aborted'));
-          signal.addEventListener('abort', onAbort, { once: true });
-        });
-
         // Manual iteration to support cancellation
         const iterator = this.input[Symbol.asyncIterator]();
         try {
           while (true) {
-            const result = await ThrowsPromise.race([iterator.next(), abortPromise]);
+            const result = await raceWithAbort(iterator.next(), signal);
 
+            if (!result) return;
             if (result.done) break;
             const ev = result.value;
 
@@ -906,18 +906,11 @@ export class SpeechStream<TModel extends STTModels> extends BaseSpeechStream {
       };
 
       const processVAD = async (stream: VADStream, socket: WebSocket, signal: AbortSignal) => {
-        const abortPromise = new ThrowsPromise<never, Error>((_, reject) => {
-          if (signal.aborted) {
-            return reject(new Error('VAD aborted'));
-          }
-          const onAbort = () => reject(new Error('VAD aborted'));
-          signal.addEventListener('abort', onAbort, { once: true });
-        });
-
         const iterator = stream[Symbol.asyncIterator]();
         try {
           while (true) {
-            const result = await ThrowsPromise.race([iterator.next(), abortPromise]);
+            const result = await raceWithAbort(iterator.next(), signal);
+            if (!result) return;
             if (result.done) break;
             if (result.value.type !== VADEventType.END_OF_SPEECH) continue;
             if (socket.readyState !== 1) return;

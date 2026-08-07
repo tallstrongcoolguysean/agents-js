@@ -10,13 +10,16 @@ import { type Agent, isAgent } from '../generator.js';
 import { JobContext, JobProcess, type RunningJobInfo, runWithJobContextAsync } from '../job.js';
 import { initializeLogger, log } from '../log.js';
 import type { SimulationContext } from '../simulation.js';
-import { Future, IdleTimeoutError, shortuuid, waitUntilTimeout } from '../utils.js';
+import { Future, shortuuid } from '../utils.js';
 import { defaultInitializeProcessFunc } from '../worker.js';
 import type { InferenceExecutor } from './inference_executor.js';
 import type { IPCMessage } from './message.js';
+import { settleShutdownStep } from './shutdown.js';
 
 const ORPHANED_TIMEOUT = 15 * 1000;
 const SESSION_CLOSE_TIMEOUT = 60 * 1000;
+const JOB_CLEANUP_STEP_TIMEOUT = 30 * 1000;
+const NATIVE_DISPOSE_TIMEOUT = 10 * 1000;
 
 const safeSend = (msg: IPCMessage): boolean => {
   try {
@@ -139,8 +142,11 @@ const startJob = (
         safeSend({ case: 'exiting', value: { reason: close[1] } });
       });
 
-      // Run the job function within the AsyncLocalStorage context
-      await runWithJobContextAsync(ctx, async () => {
+      // Run the job function within the AsyncLocalStorage context. A room
+      // disconnect may happen while entry is still waiting for initialization
+      // (for example, waitForParticipant). Race that close signal so a stuck
+      // entrypoint cannot strand the child process indefinitely.
+      const entryPromise = runWithJobContextAsync(ctx, async () => {
         const { tracer, traceTypes } = await import('../telemetry/index.js');
         return tracer.startActiveSpan(
           async (span) => {
@@ -151,15 +157,19 @@ const startJob = (
           },
           { name: 'job_entrypoint' },
         );
-      })
-        .then(async () => {
-          if (!shutdown) {
-            await closePromise;
-          }
-        })
-        .finally(async () => {
-          clearTimeout(unconnectedTimeout);
-        });
+      });
+      const firstCompleted = await Promise.race([
+        entryPromise.then(() => 'entry' as const),
+        closePromise.then(() => 'close' as const),
+      ]);
+
+      if (firstCompleted === 'entry' && !shutdown) {
+        await closePromise;
+      } else if (firstCompleted === 'close') {
+        void entryPromise.catch((entryError) =>
+          logger.debug({ error: entryError }, 'entry function rejected after job shutdown began'),
+        );
+      }
     } catch (error) {
       logger.error({ error }, 'error in entry function');
       shutdown = true;
@@ -167,47 +177,45 @@ const startJob = (
         case: 'exiting',
         value: { reason: error instanceof Error ? error.message : String(error) },
       });
+    } finally {
+      clearTimeout(unconnectedTimeout);
     }
 
     // Close the primary agent session if it exists
     if (ctx._primaryAgentSession) {
       const sessionClosePromise = ctx._primaryAgentSession.close();
-      try {
-        await waitUntilTimeout(sessionClosePromise, SESSION_CLOSE_TIMEOUT);
-      } catch (error) {
-        if (!(error instanceof IdleTimeoutError)) {
-          throw error;
-        }
-
-        void sessionClosePromise.catch((sessionCloseError) =>
-          logger.debug(
-            { error: sessionCloseError },
-            'AgentSession.close() rejected after shutdown timeout',
-          ),
-        );
-        logger.error(
-          { timeout: SESSION_CLOSE_TIMEOUT },
-          'AgentSession.close() timed out; proceeding with shutdown so registered callbacks still run.',
-        );
-      }
+      await settleShutdownStep(
+        'AgentSession.close',
+        sessionClosePromise,
+        SESSION_CLOSE_TIMEOUT,
+        logger,
+      );
     }
 
     // Generate and save/upload session report
-    try {
-      await ctx._onSessionEnd();
-    } catch (error) {
-      logger.error({ error }, 'error in ctx._onSessionEnd');
-    }
+    await settleShutdownStep(
+      'JobContext._onSessionEnd',
+      Promise.resolve().then(() => ctx._onSessionEnd()),
+      JOB_CLEANUP_STEP_TIMEOUT,
+      logger,
+    );
 
-    await room.disconnect();
-    logger.debug('disconnected from room');
+    await settleShutdownStep(
+      'Room.disconnect',
+      Promise.resolve().then(() => room.disconnect()),
+      JOB_CLEANUP_STEP_TIMEOUT,
+      logger,
+    );
+    logger.debug('room disconnect step completed');
 
-    const shutdownTasks = [];
-    for (const callback of ctx.shutdownCallbacks) {
-      shutdownTasks.push(callback());
-    }
-    await ThrowsPromise.all(shutdownTasks).catch((error) =>
-      logger.error({ error }, 'error while shutting down the job'),
+    const shutdownTasks = ctx.shutdownCallbacks.map((callback) =>
+      Promise.resolve().then(() => callback()),
+    );
+    await settleShutdownStep(
+      'shutdown callbacks',
+      ThrowsPromise.all(shutdownTasks),
+      JOB_CLEANUP_STEP_TIMEOUT,
+      logger,
     );
 
     safeSend({ case: 'done', value: undefined });
@@ -275,10 +283,18 @@ const startJob = (
     let job: JobTask | undefined = undefined;
     const closeEvent = new EventEmitter();
 
+    const shutdownOrphanedJob = () => {
+      if (job) {
+        closeEvent.emit('close', true, 'parent process disconnected');
+      } else {
+        join.resolve();
+      }
+    };
     const orphanedTimeout = setTimeout(() => {
       logger.warn('job process orphaned, shutting down.');
-      join.resolve();
+      shutdownOrphanedJob();
     }, ORPHANED_TIMEOUT);
+    process.once('disconnect', shutdownOrphanedJob);
 
     const messageHandler = (msg: IPCMessage) => {
       switch (msg.case) {
@@ -323,18 +339,20 @@ const startJob = (
     process.on('message', messageHandler);
 
     await join.await;
+    process.off('disconnect', shutdownOrphanedJob);
 
     // Dispose native FFI resources (Rust FfiServer, tokio runtimes, libwebrtc)
     // before process.exit() to prevent libc++abi mutex crash during teardown.
     // Without this, process.exit() can kill the process while native threads are
     // still running, causing: "mutex lock failed: Invalid argument"
     // See: https://github.com/livekit/node-sdks/issues/564
-    try {
-      await dispose();
-      logger.debug('native resources disposed');
-    } catch (error) {
-      logger.warn({ error }, 'failed to dispose native resources');
-    }
+    await settleShutdownStep(
+      'native resource disposal',
+      Promise.resolve().then(() => dispose()),
+      NATIVE_DISPOSE_TIMEOUT,
+      logger,
+    );
+    logger.debug('native resource disposal step completed');
 
     logger.debug('Job process shutdown');
     process.exit(0);

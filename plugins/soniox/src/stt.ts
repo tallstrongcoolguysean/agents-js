@@ -9,6 +9,7 @@ import {
   APITimeoutError,
   type AudioBuffer,
   log,
+  raceWithAbort,
   stt,
   waitForAbort,
 } from '@livekit/agents';
@@ -306,9 +307,8 @@ export class SpeechStream extends stt.SpeechStream {
   }
 
   async #sendAudio(ws: WebSocket): Promise<void> {
-    const abortPromise = waitForAbort(this.abortSignal);
     while (!this.closed) {
-      const result = await Promise.race([this.input.next(), abortPromise]);
+      const result = await raceWithAbort(this.input.next(), this.abortSignal);
       if (result === undefined || result.done) {
         break;
       }

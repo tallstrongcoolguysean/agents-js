@@ -11,6 +11,7 @@ import {
   createTimedString,
   log,
   mergeFrames,
+  raceWithAbort,
   stt,
   waitForAbort,
 } from '@livekit/agents';
@@ -288,11 +289,10 @@ export class SpeechStream extends stt.SpeechStream {
 
       const samples50ms = Math.floor(this.#opts.sampleRate / 20);
       const stream = new AudioByteStream(this.#opts.sampleRate, 1, samples50ms);
-      const abortPromise = waitForAbort(this.abortSignal);
 
       try {
         while (!this.closed) {
-          const result = await Promise.race([this.input.next(), abortPromise]);
+          const result = await raceWithAbort(this.input.next(), this.abortSignal);
 
           if (result === undefined) return;
           if (result.done) break;

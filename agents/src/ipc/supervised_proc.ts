@@ -117,7 +117,7 @@ export abstract class SupervisedProc {
       this.#logger.warn('job is unresponsive');
       clearTimeout(this.#pongTimeout);
       clearInterval(this.#pingInterval);
-      this.proc!.kill();
+      this.proc!.kill('SIGKILL');
       this.#join.resolve();
     }, this.#opts.pingTimeout);
 
@@ -243,7 +243,7 @@ export abstract class SupervisedProc {
       // On timeout (or a bad first message) the child is still alive — kill it
       // so a failed initialize doesn't leak the process.
       if (this.proc && this.proc.exitCode === null && !this.proc.killed) {
-        this.proc.kill();
+        this.proc.kill('SIGKILL');
       }
       throw err;
     } finally {
@@ -267,7 +267,7 @@ export abstract class SupervisedProc {
 
     const timer = setTimeout(() => {
       this.#logger.error('job shutdown is taking too much time');
-      this.proc!.kill();
+      this.proc!.kill('SIGKILL');
     }, this.#opts.closeTimeout);
     await this.#join.await.then(() => {
       clearTimeout(timer);

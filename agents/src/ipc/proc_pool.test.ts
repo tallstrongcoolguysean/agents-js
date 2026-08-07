@@ -65,6 +65,33 @@ describe('ProcPool warmed process lock handling', () => {
     expect(executor.close).toHaveBeenCalledTimes(1);
   });
 
+  it('waits for direct zero-idle executors to close', async () => {
+    const pool = new ProcPool('agent', 0, 1000, 1000, undefined, 0, 0);
+    let resolveClose: () => void = () => {};
+    const closePromise = new Promise<void>((resolve) => {
+      resolveClose = resolve;
+    });
+    const executor = {
+      ...createMockExecutor(),
+      close: vi.fn(() => closePromise),
+    };
+    pool.executors.push(executor);
+    pool.started = true;
+
+    let settled = false;
+    const closing = pool.close().then(() => {
+      settled = true;
+    });
+    await flushMicrotasks();
+
+    expect(executor.close).toHaveBeenCalledTimes(1);
+    expect(settled).toBe(false);
+
+    resolveClose();
+    await closing;
+    expect(settled).toBe(true);
+  });
+
   it('releases both init and proc locks when closed before proc starts', async () => {
     const pool = new ProcPool('agent', 1, 1000, 1000, undefined, 0, 0);
     const initUnlock = vi.fn();

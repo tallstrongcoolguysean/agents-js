@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 import { AudioFrame } from '@livekit/rtc-node';
+import { getEventListeners } from 'node:events';
 import { ReadableStream } from 'node:stream/web';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { initializeLogger } from '../src/log.js';
@@ -13,6 +14,7 @@ import {
   dedent,
   delay,
   isPending,
+  readStream,
   resampleStream,
   toStream,
 } from '../src/utils.js';
@@ -112,6 +114,67 @@ describe('utils', () => {
       await expect(pendingRead).resolves.toEqual({ done: true, value: undefined });
 
       expect(cleanupRan).toBe(true);
+    });
+  });
+
+  describe('readStream', () => {
+    it('delivers every chunk and removes abort listeners between reads', async () => {
+      const controller = new AbortController();
+      const stream = new ReadableStream<number>({
+        start(streamController) {
+          for (let i = 0; i < 50; i++) {
+            streamController.enqueue(i);
+          }
+          streamController.close();
+        },
+      });
+
+      const values: number[] = [];
+      for await (const value of readStream(stream, controller.signal)) {
+        values.push(value);
+        expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
+      }
+
+      expect(values).toEqual(Array.from({ length: 50 }, (_, index) => index));
+      expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
+    });
+
+    it('stops a pending read when aborted', async () => {
+      const controller = new AbortController();
+      const stream = new ReadableStream<number>();
+      const values: number[] = [];
+
+      const consuming = (async () => {
+        for await (const value of readStream(stream, controller.signal)) {
+          values.push(value);
+        }
+      })();
+
+      await delay(1);
+      controller.abort();
+      await consuming;
+
+      expect(values).toEqual([]);
+      expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
+    });
+
+    it('removes the abort listener when a read rejects', async () => {
+      const controller = new AbortController();
+      const expectedError = new Error('read failed');
+      const stream = new ReadableStream<number>({
+        pull() {
+          throw expectedError;
+        },
+      });
+
+      const consume = async () => {
+        for await (const _ of readStream(stream, controller.signal)) {
+          // no values expected
+        }
+      };
+
+      await expect(consume()).rejects.toBe(expectedError);
+      expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
     });
   });
 
@@ -701,6 +764,20 @@ describe('utils', () => {
       event.set();
       const results = await Promise.all(waiters);
       expect(results).toEqual([true, true, true]);
+    });
+
+    it('removes a canceled waiter without setting the event', async () => {
+      const event = new Event();
+      const controller = new AbortController();
+      const canceledWaiter = event.wait({ signal: controller.signal });
+
+      controller.abort();
+      await expect(canceledWaiter).resolves.toBe(false);
+      expect(event.isSet).toBe(false);
+
+      const activeWaiter = event.wait();
+      event.set();
+      await expect(activeWaiter).resolves.toBe(true);
     });
 
     it('wait after 2 seconds is still pending before set', async () => {

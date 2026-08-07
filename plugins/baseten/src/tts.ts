@@ -4,9 +4,9 @@
 import {
   type APIConnectOptions,
   AudioByteStream,
+  raceWithAbort,
   shortuuid,
   tts,
-  waitForAbort,
 } from '@livekit/agents';
 import type { AudioFrame } from '@livekit/rtc-node';
 import type { BasetenTTSOptions } from './types.js';
@@ -170,12 +170,8 @@ export class ChunkedStream extends tts.ChunkedStream {
         }
       };
 
-      // waitForAbort internally sets up an abort listener on the abort signal
-      // we need to put it outside loop to avoid constant re-registration of the listener
-      const abortPromise = waitForAbort(this.abortSignal);
-
       while (!this.abortSignal.aborted) {
-        const result = await Promise.race([reader.read(), abortPromise]);
+        const result = await raceWithAbort(reader.read(), this.abortSignal);
 
         if (result === undefined) break; // aborted
 

@@ -42,9 +42,9 @@ import {
   Future,
   IdleTimeoutError,
   Task,
+  raceWithAbort,
   shortuuid,
   toError,
-  waitForAbort,
   waitUntilTimeout,
 } from '../utils.js';
 import {
@@ -585,15 +585,13 @@ export function performLLMInference(
         return;
       }
 
-      const abortPromise = waitForAbort(signal);
-
       // TODO(brian): add support for dynamic tools
 
       llmStreamReader = llmStream.getReader();
       while (true) {
         if (signal.aborted) break;
 
-        const result = await ThrowsPromise.race([llmStreamReader.read(), abortPromise]);
+        const result = await raceWithAbort(llmStreamReader.read(), signal);
         if (result === undefined) break;
 
         const { done, value: chunk } = result;

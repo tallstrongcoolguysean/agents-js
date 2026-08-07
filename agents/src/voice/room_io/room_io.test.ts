@@ -268,6 +268,71 @@ describe('RoomIO deleteRoomOnClose', () => {
     vi.useRealTimers();
   });
 
+  it('shuts down the job when the linked participant closes the session', async () => {
+    const shutdown = vi.fn();
+    const jobContext = {
+      shutdown,
+      _primaryAgentSession: undefined,
+    } as unknown as NonNullable<ReturnType<typeof jobModule.getJobContext>>;
+    vi.spyOn(jobModule, 'getJobContext').mockReturnValue(jobContext);
+    const room = createFakeRoom();
+    const session = createFakeSession();
+    jobContext._primaryAgentSession = session as unknown as typeof jobContext._primaryAgentSession;
+    const roomIO = new RoomIO({
+      agentSession: session as unknown as RoomIOArgs['agentSession'],
+      room: room as unknown as RoomIOArgs['room'],
+      inputOptions: {
+        audioEnabled: false,
+        textEnabled: false,
+      },
+      outputOptions: {
+        audioEnabled: false,
+        transcriptionEnabled: false,
+      },
+    });
+
+    roomIO.start();
+    session.emit(
+      AgentSessionEventTypes.Close,
+      createCloseEvent(CloseReason.PARTICIPANT_DISCONNECTED, null),
+    );
+    await roomIO.close();
+
+    expect(shutdown).toHaveBeenCalledTimes(1);
+    expect(shutdown).toHaveBeenCalledWith('primary participant disconnected');
+  });
+
+  it('does not shut down the job when a secondary session closes', async () => {
+    const shutdown = vi.fn();
+    vi.spyOn(jobModule, 'getJobContext').mockReturnValue({
+      shutdown,
+      _primaryAgentSession: {},
+    } as unknown as ReturnType<typeof jobModule.getJobContext>);
+    const room = createFakeRoom();
+    const session = createFakeSession();
+    const roomIO = new RoomIO({
+      agentSession: session as unknown as RoomIOArgs['agentSession'],
+      room: room as unknown as RoomIOArgs['room'],
+      inputOptions: {
+        audioEnabled: false,
+        textEnabled: false,
+      },
+      outputOptions: {
+        audioEnabled: false,
+        transcriptionEnabled: false,
+      },
+    });
+
+    roomIO.start();
+    session.emit(
+      AgentSessionEventTypes.Close,
+      createCloseEvent(CloseReason.PARTICIPANT_DISCONNECTED, null),
+    );
+    await roomIO.close();
+
+    expect(shutdown).not.toHaveBeenCalled();
+  });
+
   it('does not delete the room by default when the session closes', async () => {
     const deleteRoom = vi.fn(async () => {});
     vi.spyOn(jobModule, 'getJobContext').mockReturnValue({

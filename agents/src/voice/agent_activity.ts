@@ -81,7 +81,6 @@ import {
   isDevMode,
   isHosted,
   isPending,
-  waitForAbort,
   waitUntilTimeout,
 } from '../utils.js';
 import { VAD, type VADEvent } from '../vad.js';
@@ -291,10 +290,23 @@ async function raceWithAbort<T>(
   if (signal.aborted) {
     return (await isPending(p)) ? undefined : ThrowsPromise.fromPromise<T | undefined, Error>(p);
   }
-  return ThrowsPromise.race([
-    ThrowsPromise.fromPromise<T | undefined, Error>(p),
-    ThrowsPromise.fromPromise<undefined, Error>(waitForAbort(signal).then(() => undefined)),
-  ]);
+
+  let resolveAbort!: () => void;
+  const abortPromise = new Promise<undefined>((resolve) => {
+    resolveAbort = () => resolve(undefined);
+  });
+  const onAbort = () => resolveAbort();
+  signal.addEventListener('abort', onAbort, { once: true });
+
+  try {
+    return await ThrowsPromise.race([
+      ThrowsPromise.fromPromise<T | undefined, Error>(p),
+      ThrowsPromise.fromPromise<undefined, Error>(abortPromise),
+    ]);
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+    resolveAbort();
+  }
 }
 
 export class AgentActivity implements RecognitionHooks {
@@ -1818,7 +1830,7 @@ export class AgentActivity implements RecognitionHooks {
     void waitInactiveResult.catch(() => undefined);
 
     try {
-      await ThrowsPromise.race([agentSpeaking.await, waitInactiveResult, waitForAbort(signal)]);
+      await raceWithAbort(Promise.race([agentSpeaking.await, waitInactiveResult]), signal);
       if (signal.aborted) {
         return;
       }
@@ -2070,7 +2082,7 @@ export class AgentActivity implements RecognitionHooks {
     errorMessage: string,
   ): Promise<void> {
     try {
-      await Promise.race([promise, waitForAbort(signal)]);
+      await raceWithAbort(promise, signal);
     } catch (error) {
       if (!signal.aborted) {
         this.logger.error({ error }, errorMessage);
@@ -2078,16 +2090,9 @@ export class AgentActivity implements RecognitionHooks {
     }
   }
 
-  private async mainTask(signal: AbortSignal): Promise<void> {
-    const abortFuture = new Future<void, never>();
-    const abortHandler = () => {
-      abortFuture.resolve();
-      signal.removeEventListener('abort', abortHandler);
-    };
-    signal.addEventListener('abort', abortHandler);
-
+  private async mainTask(signal: AbortSignal): Promise<Throws<void, Error>> {
     while (true) {
-      await ThrowsPromise.race([this.q_updated.await, abortFuture.await]);
+      await raceWithAbort(this.q_updated.await, signal);
       if (signal.aborted) break;
 
       while (this.speechQueue.size() > 0) {
@@ -2119,7 +2124,7 @@ export class AgentActivity implements RecognitionHooks {
         // Keep the shared outputs serialized through interrupted-generation cleanup.
         // Bare handles have no owner task that can settle the generation future.
         if (speechHandle.interrupted && speechHandle._tasks.length > 0) {
-          await ThrowsPromise.race([generation, abortFuture.await]);
+          await raceWithAbort(generation, signal);
         }
         this._currentSpeech = undefined;
       }

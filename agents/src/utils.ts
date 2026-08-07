@@ -192,19 +192,23 @@ export class Event {
   #isSet = false;
   #waiters: Array<() => void> = [];
 
-  async wait() {
+  async wait(options: { signal?: AbortSignal } = {}) {
     if (this.#isSet) return true;
+    if (options.signal?.aborted) return false;
 
     let resolve: () => void = noop;
     const waiter = new ThrowsPromise<void, never>((r) => {
       resolve = r;
       this.#waiters.push(resolve);
     });
+    const onAbort = () => resolve();
+    options.signal?.addEventListener('abort', onAbort, { once: true });
 
     try {
       await waiter;
-      return true;
+      return !options.signal?.aborted;
     } finally {
+      options.signal?.removeEventListener('abort', onAbort);
       const index = this.#waiters.indexOf(resolve);
       if (index !== -1) {
         this.#waiters.splice(index, 1);
@@ -1387,9 +1391,8 @@ export async function* readStream<T>(
   const reader = stream.getReader();
   try {
     if (signal) {
-      const abortPromise = waitForAbort(signal);
       while (true) {
-        const result = await ThrowsPromise.race([reader.read(), abortPromise]);
+        const result = await raceWithAbort(reader.read(), signal);
         if (!result) {
           break;
         }
@@ -1414,6 +1417,47 @@ export async function* readStream<T>(
     } catch {
       // stream cleanup errors are expected (releasing reader, controller closed, etc.)
     }
+  }
+}
+
+/**
+ * Waits for one operation or for any supplied signal to abort.
+ *
+ * The abort promise and listeners are scoped to one operation. This is
+ * important for loops: repeatedly racing work against one long-lived pending
+ * promise retains every settled race result through that promise's reaction
+ * list until teardown.
+ *
+ * @internal
+ */
+export async function raceWithAbort<T>(
+  operation: Promise<T>,
+  ...abortSignals: AbortSignal[]
+): Promise<T | undefined> {
+  const signals = [...new Set(abortSignals)];
+  if (signals.some((signal) => signal.aborted)) {
+    return undefined;
+  }
+
+  let resolveAbort!: () => void;
+  const abortPromise = new Promise<undefined>((resolve) => {
+    resolveAbort = () => resolve(undefined);
+  });
+  const onAbort = () => resolveAbort();
+
+  for (const signal of signals) {
+    signal.addEventListener('abort', onAbort, { once: true });
+  }
+
+  try {
+    return await Promise.race([operation, abortPromise]);
+  } finally {
+    for (const signal of signals) {
+      signal.removeEventListener('abort', onAbort);
+    }
+    // Settle the losing abort promise so it cannot retain the winning result
+    // through an unresolved Promise.race reaction.
+    resolveAbort();
   }
 }
 

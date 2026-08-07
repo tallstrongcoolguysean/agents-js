@@ -86,6 +86,74 @@ describe('createSilenceFrame helpers', () => {
 describe('AudioRecognition substitutes silence on the STT path only', () => {
   initializeLogger({ pretty: false, level: 'silent' });
 
+  it('drains input without allocating VAD/STT branches for a realtime-only session', async () => {
+    const recognition = new AudioRecognition({
+      recognitionHooks: createHooks(),
+      minEndpointingDelay: 0,
+      maxEndpointingDelay: 0,
+    });
+    const internals = recognition as unknown as {
+      vadInputStream?: ReadableStream<AudioFrame>;
+      sttInputStream?: ReadableStream<AudioFrame>;
+      inputDrainTask?: { result: Promise<void> };
+    };
+    let produced = 0;
+
+    try {
+      await recognition.start();
+      recognition.setInputAudioStream(
+        new ReadableStream<AudioFrame>({
+          pull(controller) {
+            if (produced === 100) {
+              controller.close();
+              return;
+            }
+            controller.enqueue(markerFrame(produced++));
+          },
+        }),
+      );
+
+      await waitFor(() => produced === 100);
+      await internals.inputDrainTask?.result;
+      expect(internals.vadInputStream).toBeUndefined();
+      expect(internals.sttInputStream).toBeUndefined();
+    } finally {
+      await recognition.close();
+    }
+  });
+
+  it('does not queue unbounded frames for a stalled audio subscriber', async () => {
+    const recognition = new AudioRecognition({
+      recognitionHooks: createHooks(),
+      minEndpointingDelay: 0,
+      maxEndpointingDelay: 0,
+    });
+    const internals = recognition as unknown as {
+      subscriberWriters: WritableStreamDefaultWriter<AudioFrame>[];
+    };
+    recognition.subscribeAudioStream();
+
+    try {
+      await recognition.start();
+      recognition.setInputAudioStream(
+        new ReadableStream<AudioFrame>({
+          start(controller) {
+            for (let i = 0; i < 100; i++) {
+              controller.enqueue(markerFrame(i));
+            }
+            controller.close();
+          },
+        }),
+      );
+
+      await flushTasks();
+      await flushTasks();
+      expect(internals.subscriberWriters[0]?.desiredSize).toBe(0);
+    } finally {
+      await recognition.close();
+    }
+  });
+
   it('forwards the real frame to every consumer when no discard predicate is set', async () => {
     const sttFrames: AudioFrame[] = [];
     const sttNode: STTNode = async (audioStream) => {

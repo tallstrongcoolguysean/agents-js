@@ -19,6 +19,7 @@ import {
   log,
   mergeFrames,
   normalizeLanguage,
+  raceWithAbort,
   stt,
   waitForAbort,
 } from '@livekit/agents';
@@ -567,7 +568,7 @@ export class SpeechStream extends stt.SpeechStream {
 
         const keepaliveTask = Task.from(async (controller) => {
           while (!controller.signal.aborted) {
-            await Promise.race([delay(10000), waitForAbort(controller.signal)]);
+            await delay(10000, { signal: controller.signal });
             if (controller.signal.aborted || ws?.readyState !== WebSocket.OPEN) return;
             ws.send(
               JSON.stringify({
@@ -583,17 +584,15 @@ export class SpeechStream extends stt.SpeechStream {
         const sendTask = Task.from(async (controller) => {
           const samples50Ms = Math.floor(this.#opts.sampleRate / 20);
           const audioByteStream = new AudioByteStream(this.#opts.sampleRate, 1, samples50Ms);
-          const abortPromise = waitForAbort(controller.signal);
-          const streamAbortPromise = waitForAbort(this.abortSignal);
           let hasEnded = false;
 
           try {
             while (!this.closed) {
-              const result = await Promise.race([
+              const result = await raceWithAbort(
                 this.input.next(),
-                abortPromise,
-                streamAbortPromise,
-              ]);
+                controller.signal,
+                this.abortSignal,
+              );
               if (result === undefined) return;
               if (result.done) break;
 

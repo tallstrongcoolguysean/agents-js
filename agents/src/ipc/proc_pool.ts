@@ -169,11 +169,14 @@ export class ProcPool {
     }
     this.closed = true;
     this.controller.abort();
+    const executorsToClose = new Set(this.executors);
     this.warmedProcQueue.items.forEach((e) => {
       e.unlock();
-      e.proc.close();
+      executorsToClose.add(e.proc);
     });
-    this.executors.forEach((e) => e.close());
-    await ThrowsPromise.allSettled(this.tasks);
+    const closeTasks = [...executorsToClose].map((executor) =>
+      Promise.resolve().then(() => executor.close()),
+    );
+    await ThrowsPromise.allSettled([...this.tasks, ...closeTasks]);
   }
 }

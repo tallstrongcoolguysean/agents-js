@@ -231,7 +231,11 @@ describe('init timeout rejection handling', () => {
     // A child that never responds would survive a failed initialize() —
     // initialize() must kill it so the process doesn't leak.
     const hangScript = join(tmpdir(), 'test_hang_init_child.mjs');
-    writeFileSync(hangScript, `setInterval(() => {}, 1000);`);
+    writeFileSync(
+      hangScript,
+      `process.on('SIGTERM', () => {});
+       setInterval(() => {}, 1000);`,
+    );
 
     const { SupervisedProc } = await import('./supervised_proc.js');
     class TestProc extends SupervisedProc {

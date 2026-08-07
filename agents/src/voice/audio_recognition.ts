@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Mutex } from '@livekit/mutex';
 import type { AudioFrame, ParticipantKind } from '@livekit/rtc-node';
-import { ThrowsPromise } from '@livekit/throws-transformer/throws';
 import {
   type Context,
   ROOT_CONTEXT,
@@ -39,7 +38,7 @@ import { type SpeechEvent, SpeechEventType } from '../stt/stt.js';
 import { traceTypes, tracer } from '../telemetry/index.js';
 import { splitWords } from '../tokenize/basic/word.js';
 import type { Future } from '../utils.js';
-import { Task, cancelAndWait, delay, readStream, waitForAbort } from '../utils.js';
+import { Task, cancelAndWait, delay, raceWithAbort, readStream } from '../utils.js';
 import { type VAD, type VADEvent, VADEventType, type VADStream } from '../vad.js';
 import type { TurnDetectionMode } from './agent_session.js';
 import {
@@ -342,8 +341,9 @@ export class AudioRecognition {
   // provider's logs for debugging.
   private sttRequestIds: string[] = [];
 
-  private vadInputStream: ReadableStream<AudioFrame>;
-  private sttInputStream: ReadableStream<AudioFrame>;
+  private vadInputStream?: ReadableStream<AudioFrame>;
+  private sttInputStream?: ReadableStream<AudioFrame>;
+  private unusedInputStream?: ReadableStream<AudioFrame>;
   /**
    * Active subscriber writers fed from {@link subscribersBroadcast}. Each
    * {@link subscribeAudioStream} call appends one entry; entries are dropped
@@ -356,8 +356,7 @@ export class AudioRecognition {
    * subscriber is registered.
    */
   private subscriberWriters: WritableStreamDefaultWriter<AudioFrame>[] = [];
-  private silenceAudioTransform = new IdentityTransform<AudioFrame>();
-  private silenceAudioWriter: WritableStreamDefaultWriter<AudioFrame>;
+  private silenceAudioWriter?: WritableStreamDefaultWriter<AudioFrame>;
   private sttOwnershipTransferred = false;
   private readonly sttLifecycleLock = new Mutex();
 
@@ -369,6 +368,7 @@ export class AudioRecognition {
   private vadStream?: VADStream;
   private sttConsumerTask?: Task<void>;
   private interruptionTask?: Task<void>;
+  private inputDrainTask?: Task<void>;
 
   // interruption detection
   private interruptionDetection?: AdaptiveInterruptionDetector;
@@ -469,6 +469,12 @@ export class AudioRecognition {
           }
           if (this.subscriberWriters.length === 0) return;
           for (const writer of this.subscriberWriters) {
+            // Realtime audio cannot be backpressured indefinitely. If a
+            // subscriber falls behind, drop this frame instead of building an
+            // unbounded chain of pending writer promises.
+            if (writer.desiredSize !== null && writer.desiredSize <= 0) {
+              continue;
+            }
             writer.write(chunk).catch(() => {
               // Subscriber stream closed or backpressure exceeded; drop.
             });
@@ -496,25 +502,46 @@ export class AudioRecognition {
       );
     };
 
-    if (opts.interruptionDetection) {
-      const [vadInputStream, teedInput] = primaryInputStream.tee();
-      const [inputStream, sttInputStream] = teedInput.tee();
-      this.vadInputStream = vadInputStream;
-      this.sttInputStream = mergeReadableStreams(
-        replaceSttInputWithSilence(sttInputStream),
-        this.silenceAudioTransform.readable,
-      );
-      this.interruptionStreamChannel = createStreamChannel();
-      this.interruptionStreamChannel.addStreamInput(inputStream);
-    } else {
-      const [vadInputStream, sttInputStream] = primaryInputStream.tee();
-      this.vadInputStream = vadInputStream;
-      this.sttInputStream = mergeReadableStreams(
-        replaceSttInputWithSilence(sttInputStream),
-        this.silenceAudioTransform.readable,
-      );
+    const consumers: Array<'vad' | 'stt' | 'interruption'> = [];
+    if (opts.vad) consumers.push('vad');
+    if (opts.stt) consumers.push('stt');
+    if (opts.interruptionDetection) consumers.push('interruption');
+
+    const inputStreams: ReadableStream<AudioFrame>[] = [];
+    let remainingStream = primaryInputStream;
+    for (let i = 1; i < consumers.length; i++) {
+      const [consumerStream, rest] = remainingStream.tee();
+      inputStreams.push(consumerStream);
+      remainingStream = rest;
     }
-    this.silenceAudioWriter = this.silenceAudioTransform.writable.getWriter();
+    if (consumers.length > 0) {
+      inputStreams.push(remainingStream);
+    }
+
+    for (let i = 0; i < consumers.length; i++) {
+      const consumer = consumers[i]!;
+      const inputStream = inputStreams[i]!;
+      if (consumer === 'vad') {
+        this.vadInputStream = inputStream;
+      } else if (consumer === 'stt') {
+        const silenceAudioTransform = new IdentityTransform<AudioFrame>();
+        this.silenceAudioWriter = silenceAudioTransform.writable.getWriter();
+        this.sttInputStream = mergeReadableStreams(
+          replaceSttInputWithSilence(inputStream),
+          silenceAudioTransform.readable,
+        );
+      } else {
+        this.interruptionStreamChannel = createStreamChannel();
+        this.interruptionStreamChannel.addStreamInput(inputStream);
+      }
+    }
+
+    if (consumers.length === 0) {
+      // Realtime models handle turn detection and transcription themselves.
+      // Drain the recognition side so the upstream AgentActivity tee cannot
+      // buffer every inbound frame in an unread branch.
+      this.unusedInputStream = primaryInputStream;
+    }
   }
 
   /**
@@ -652,6 +679,18 @@ export class AudioRecognition {
     sttPipeline?: STTPipeline;
     turnDetectorStream?: BaseStreamingTurnDetectorStream;
   }) {
+    if (this.unusedInputStream) {
+      this.inputDrainTask = Task.from(async ({ signal }) => {
+        for await (const _ of readStream(this.unusedInputStream!, signal)) {
+          // Deliberately discard audio that has no local recognition consumer.
+        }
+      });
+      this.inputDrainTask.result.catch((err) => {
+        if (err instanceof Error && err.name === 'AbortError') return;
+        this.logger.error({ error: err }, 'Error draining unused recognition audio');
+      });
+    }
+
     this.startSttTasks(options?.sttPipeline);
 
     this.vadTask = Task.from(({ signal }) => this.createVadTask(this.vad, signal));
@@ -676,6 +715,8 @@ export class AudioRecognition {
   }
 
   async stop() {
+    await this.inputDrainTask?.cancelAndWait();
+    this.inputDrainTask = undefined;
     await this.sttConsumerTask?.cancelAndWait();
     await this.sttForwardTask?.cancelAndWait();
     await this.vadTask?.cancelAndWait();
@@ -1817,6 +1858,7 @@ export class AudioRecognition {
   }
 
   private async forwardInputAudioToStt(pipeline: STTPipeline, signal: AbortSignal) {
+    if (!this.sttInputStream) return;
     for await (const frame of readStream(this.sttInputStream, signal)) {
       const frameDurationMs = (frame.samplesPerChannel / frame.sampleRate) * 1000;
       pipeline.inputStartedAt ??= Date.now() - frameDurationMs;
@@ -1835,7 +1877,11 @@ export class AudioRecognition {
 
     const vadStream = vad.stream();
     this.vadStream = vadStream;
-    vadStream.updateInputStream(this.vadInputStream);
+    // Direct/internal invocations may supply a VAD after construction. Normal
+    // configured VAD sessions always have the consumer stream.
+    if (this.vadInputStream) {
+      vadStream.updateInputStream(this.vadInputStream);
+    }
 
     const abortHandler = () => {
       vadStream.detachInputStream();
@@ -1996,11 +2042,10 @@ export class AudioRecognition {
 
         forwardTask = (async () => {
           const inputReader = this.interruptionStreamChannel!.stream().getReader();
-          const abortPromise = waitForAbort(signal);
 
           try {
             while (!signal.aborted) {
-              const res = await ThrowsPromise.race([inputReader.read(), abortPromise]);
+              const res = await raceWithAbort(inputReader.read(), signal);
               if (!res) break;
 
               const { value, done } = res;
@@ -2013,10 +2058,8 @@ export class AudioRecognition {
           }
         })();
 
-        const abortPromise = waitForAbort(signal);
-
         while (!signal.aborted) {
-          const res = await ThrowsPromise.race([eventReader.read(), abortPromise]);
+          const res = await raceWithAbort(eventReader.read(), signal);
           if (!res) break;
           const { done, value: ev } = res;
           if (done) break;
@@ -2104,15 +2147,20 @@ export class AudioRecognition {
    * detector pushing audio into `_AMDClassifier.push_audio`).
    */
   subscribeAudioStream(): ReadableStream<AudioFrame> {
-    const transform = new IdentityTransform<AudioFrame>();
+    const transform = new TransformStream<AudioFrame, AudioFrame>(
+      {
+        transform: (chunk, controller) => controller.enqueue(chunk),
+      },
+      { highWaterMark: 1 },
+      { highWaterMark: 1 },
+    );
     const writer = transform.writable.getWriter();
     this.subscriberWriters.push(writer);
     // Auto-prune the entry once the subscriber's readable side is cancelled
     // or its writer otherwise errors. Without this, a subscriber that hands
     // back its stream (e.g. AMD's STT pump after `aclose()`) leaves a writer
     // in `subscriberWriters` that the broadcast transform keeps writing into
-    // — frames pile up in the IdentityTransform queue until
-    // `AudioRecognition.close()` runs, leaking ~16-32 KB/s.
+    // — frames would otherwise remain queued until `AudioRecognition.close()`.
     writer.closed
       .catch(() => {
         // closed/errored — fall through to the prune below
@@ -2201,7 +2249,7 @@ export class AudioRecognition {
           // flush the stt by pushing silence
           if (audioDetached && this.sampleRate !== undefined) {
             const silenceFrame = createSilenceFrame(delayDuration, this.sampleRate);
-            this.silenceAudioWriter.write(silenceFrame);
+            void this.silenceAudioWriter?.write(silenceFrame);
           }
 
           // wait for the final transcript to be available
@@ -2240,7 +2288,9 @@ export class AudioRecognition {
   async close() {
     this.closed = true;
     this.detachInputAudioStream();
-    this.silenceAudioWriter.releaseLock();
+    this.silenceAudioWriter?.releaseLock();
+    await this.inputDrainTask?.cancelAndWait();
+    this.inputDrainTask = undefined;
     await this.commitUserTurnTask?.cancelAndWait();
     await this.stopSttTasks();
 
@@ -2249,11 +2299,17 @@ export class AudioRecognition {
       this.sttPipeline = undefined;
     }
 
-    // Close any outstanding broadcast subscribers so their consumers see EOF
-    // and don't keep the IdentityTransform queues pinned in memory.
+    // Close healthy broadcast subscribers with EOF. Abort a backpressured
+    // subscriber so teardown cannot hang behind its unread bounded queue.
     for (const writer of this.subscriberWriters) {
       try {
-        await writer.close();
+        if (writer.desiredSize !== null && writer.desiredSize <= 0) {
+          void writer
+            .abort(new Error('audio recognition subscriber closed while backpressured'))
+            .catch(() => undefined);
+        } else {
+          await writer.close();
+        }
       } catch {
         // already closed / aborted
       }
