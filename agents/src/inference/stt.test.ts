@@ -129,6 +129,79 @@ describe('Inference STT start of speech', () => {
   });
 });
 
+describe('Inference STT final turn deduplication', () => {
+  it('drops repeated finals with the same provider turn order', () => {
+    const { stream, events } = makeSpeechStream();
+    const first = {
+      ...transcript('Hey, can you hear me?', true),
+      session_id: 'session-1',
+      extra: { turn_order: 4 },
+    };
+    const duplicate = {
+      ...transcript('hey can you hear me', true),
+      session_id: 'session-1',
+      extra: { turn_order: 4 },
+    };
+
+    stream['processTranscript'](first, SpeechEventType.FINAL_TRANSCRIPT);
+    stream['processTranscript'](duplicate, SpeechEventType.FINAL_TRANSCRIPT);
+
+    expect(events.filter(({ type }) => type === SpeechEventType.FINAL_TRANSCRIPT)).toHaveLength(1);
+  });
+
+  it('keeps repeated speech from different provider turns', () => {
+    const { stream, events } = makeSpeechStream();
+    const first = {
+      ...transcript('yes', true),
+      session_id: 'session-1',
+      extra: { turn_order: 4 },
+    };
+    const repeatedLater = {
+      ...transcript('yes', true),
+      session_id: 'session-1',
+      extra: { turn_order: 5 },
+    };
+
+    stream['processTranscript'](first, SpeechEventType.FINAL_TRANSCRIPT);
+    stream['processTranscript'](repeatedLater, SpeechEventType.FINAL_TRANSCRIPT);
+
+    expect(events.filter(({ type }) => type === SpeechEventType.FINAL_TRANSCRIPT)).toHaveLength(2);
+  });
+
+  it('drops an immediate second AssemblyAI final without intervening activity', () => {
+    const { stream, events } = makeSpeechStream();
+    stream['opts'] = {
+      ...stream['opts'],
+      model: 'assemblyai/universal-streaming',
+    };
+
+    stream['processTranscript'](
+      transcript('Hey, can you hear me?', true),
+      SpeechEventType.FINAL_TRANSCRIPT,
+    );
+    stream['processTranscript'](
+      transcript('hey can you hear me', true),
+      SpeechEventType.FINAL_TRANSCRIPT,
+    );
+
+    expect(events.filter(({ type }) => type === SpeechEventType.FINAL_TRANSCRIPT)).toHaveLength(1);
+  });
+
+  it('keeps a later AssemblyAI final after new transcript activity', () => {
+    const { stream, events } = makeSpeechStream();
+    stream['opts'] = {
+      ...stream['opts'],
+      model: 'assemblyai/universal-streaming',
+    };
+
+    stream['processTranscript'](transcript('yes', true), SpeechEventType.FINAL_TRANSCRIPT);
+    stream['processTranscript'](transcript('yes'), SpeechEventType.INTERIM_TRANSCRIPT);
+    stream['processTranscript'](transcript('yes', true), SpeechEventType.FINAL_TRANSCRIPT);
+
+    expect(events.filter(({ type }) => type === SpeechEventType.FINAL_TRANSCRIPT)).toHaveLength(2);
+  });
+});
+
 describe('parseSTTModelString', () => {
   it('simple model without language', () => {
     const [model, language] = parseSTTModelString('deepgram');

@@ -547,6 +547,7 @@ export function performLLMInference(
   controller: AbortController,
   model?: string,
   provider?: string,
+  speechId?: string,
 ): [Task<void>, _LLMGenerationData] {
   const logger = log();
   const textStream = new IdentityTransform<string | FlushSentinel>();
@@ -557,13 +558,18 @@ export function performLLMInference(
   const data = new _LLMGenerationData(textStream.readable, toolCallStream.readable);
 
   const _performLLMInferenceImpl = async (signal: AbortSignal, span: Span) => {
-    span.setAttribute(
-      traceTypes.ATTR_CHAT_CTX,
-      // snake_case wire shape, matching Python's `chat_ctx.to_dict()` for this span attribute
-      // (toJSON() emits camelCase). Defaults exclude image/audio/timestamps like the Python side.
-      JSON.stringify(toSnakeCaseDeep(chatCtx.toJSON())),
-    );
-    span.setAttribute(traceTypes.ATTR_FUNCTION_TOOLS, JSON.stringify(sortedToolNames(toolCtx)));
+    try {
+      span.setAttribute(
+        traceTypes.ATTR_CHAT_CTX,
+        // snake_case wire shape, matching Python's `chat_ctx.to_dict()` for this span attribute
+        // (toJSON() emits camelCase). Defaults exclude image/audio/timestamps like the Python side.
+        JSON.stringify(toSnakeCaseDeep(chatCtx.toJSON())),
+      );
+      span.setAttribute(traceTypes.ATTR_FUNCTION_TOOLS, JSON.stringify(sortedToolNames(toolCtx)));
+    } catch (error) {
+      logger.error({ error, speech_id: speechId }, 'failed to serialize LLM inference context');
+      throw error;
+    }
 
     if (model) {
       span.setAttribute(traceTypes.ATTR_GEN_AI_REQUEST_MODEL, model);
@@ -577,9 +583,30 @@ export function performLLMInference(
     let llmStream: ReadableStream<string | ChatChunk | FlushSentinel> | null = null;
     const startTime = performance.now() / 1000; // Convert to seconds
     let firstTokenReceived = false;
+    const onAbort = () => {
+      logger.debug(
+        {
+          speech_id: speechId,
+          reason:
+            signal.reason instanceof Error
+              ? { name: signal.reason.name, message: signal.reason.message }
+              : signal.reason,
+        },
+        'LLM inference abort signal received',
+      );
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
 
     try {
+      logger.debug(
+        { speech_id: speechId, signal_aborted: signal.aborted },
+        'invoking agent LLM node',
+      );
       llmStream = await node(chatCtx, toolCtx, modelSettings);
+      logger.debug(
+        { speech_id: speechId, has_stream: llmStream !== null, signal_aborted: signal.aborted },
+        'agent LLM node returned',
+      );
       if (llmStream === null) {
         await textWriter.close();
         return;
@@ -654,6 +681,7 @@ export function performLLMInference(
       logger.error({ error }, 'error in llm node');
       throw error;
     } finally {
+      signal.removeEventListener('abort', onAbort);
       span.setAttribute(traceTypes.ATTR_RESPONSE_TEXT, data.generatedText);
       span.setAttribute(
         traceTypes.ATTR_RESPONSE_FUNCTION_CALLS,

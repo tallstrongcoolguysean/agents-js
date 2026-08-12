@@ -738,6 +738,10 @@ export class SpeechStream<TModel extends STTModels> extends BaseSpeechStream {
   private stt: STT<TModel>;
   private connOptions: APIConnectOptions;
   private activeWs?: WebSocket;
+  private finalTurnKeys = new Set<string>();
+  private finalTurnKeyOrder: string[] = [];
+  private lastFinalReceivedAt = 0;
+  private providerActivitySinceFinal = true;
 
   #logger = log();
 
@@ -959,6 +963,7 @@ export class SpeechStream<TModel extends STTModels> extends BaseSpeechStream {
                 resourceCleanup();
                 break;
               case 'start_of_speech':
+                this.providerActivitySinceFinal = true;
                 this.processStartOfSpeech();
                 break;
               case 'interim_transcript':
@@ -1063,6 +1068,49 @@ export class SpeechStream<TModel extends STTModels> extends BaseSpeechStream {
     const language = normalizeLanguage(data.language || this.opts.language || 'en');
 
     if (!text && eventType !== SpeechEventType.FINAL_TRANSCRIPT) return;
+    if (eventType !== SpeechEventType.FINAL_TRANSCRIPT) {
+      this.providerActivitySinceFinal = true;
+    }
+    if (eventType === SpeechEventType.FINAL_TRANSCRIPT) {
+      const extra =
+        data.extra && typeof data.extra === 'object' && !Array.isArray(data.extra)
+          ? (data.extra as Record<string, unknown>)
+          : undefined;
+      const turnOrder = extra?.turn_order ?? extra?.turnOrder;
+      if (typeof turnOrder === 'string' || typeof turnOrder === 'number') {
+        const turnKey = `${requestId}:${turnOrder}`;
+        this.finalTurnKeys ??= new Set<string>();
+        this.finalTurnKeyOrder ??= [];
+        if (this.finalTurnKeys.has(turnKey)) {
+          log().debug(
+            { request_id: requestId, turn_order: turnOrder, transcript: text },
+            'dropping duplicate final transcript for provider turn',
+          );
+          return;
+        }
+
+        this.finalTurnKeys.add(turnKey);
+        this.finalTurnKeyOrder.push(turnKey);
+        if (this.finalTurnKeyOrder.length > 256) {
+          const expiredKey = this.finalTurnKeyOrder.shift();
+          if (expiredKey !== undefined) {
+            this.finalTurnKeys.delete(expiredKey);
+          }
+        }
+      } else if (
+        this.opts.model?.startsWith('assemblyai/') &&
+        !this.providerActivitySinceFinal &&
+        Date.now() - this.lastFinalReceivedAt <= 250
+      ) {
+        log().debug(
+          { request_id: requestId, transcript: text },
+          'dropping immediate duplicate AssemblyAI final transcript',
+        );
+        return;
+      }
+      this.lastFinalReceivedAt = Date.now();
+      this.providerActivitySinceFinal = false;
+    }
 
     try {
       this.processStartOfSpeech();

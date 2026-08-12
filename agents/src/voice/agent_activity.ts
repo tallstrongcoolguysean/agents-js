@@ -2858,6 +2858,7 @@ export class AgentActivity implements RecognitionHooks {
       replyAbortController,
       this.llm?.model,
       this.llm?.provider,
+      speechHandle.id,
     );
     tasks.push(llmTask);
 
@@ -2965,7 +2966,9 @@ export class AgentActivity implements RecognitionHooks {
     }
 
     if (speechHandle.interrupted) {
-      replyAbortController.abort();
+      replyAbortController.abort(
+        new Error('speech handle interrupted before pipeline synthesis'),
+      );
       await cancelAndWait(tasks, REPLY_TASK_CANCEL_TIMEOUT);
       return;
     }
@@ -3242,7 +3245,9 @@ export class AgentActivity implements RecognitionHooks {
         'Aborting all pipeline reply tasks due to interruption',
       );
 
-      replyAbortController.abort();
+      replyAbortController.abort(
+        new Error('speech handle interrupted during pipeline generation'),
+      );
       await cancelAndWait(tasks, REPLY_TASK_CANCEL_TIMEOUT);
 
       const forwardedText = segmentOutputs.map(forwardedTextFor).join('');
