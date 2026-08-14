@@ -964,6 +964,34 @@ describe('AgentActivity - waitForIdle close abort', () => {
 });
 
 describe('AgentActivity - interrupted tool completion', () => {
+  it('commits a completed tool output immediately and only once', () => {
+    const toolItemsAdded = vi.fn();
+    const activity = Object.create(AgentActivity.prototype) as AgentActivity;
+    const chatCtx = ChatContext.empty();
+    Object.assign(activity, {
+      agent: { _chatCtx: chatCtx },
+      agentSession: { _toolItemsAdded: toolItemsAdded },
+    });
+    const output = FunctionCallOutput.create({
+      callId: 'call_immediate',
+      name: 'quiz_user',
+      output: 'quiz displayed',
+      isError: false,
+    });
+    const commitToolCallOutputs = (
+      activity as unknown as {
+        commitToolCallOutputs: (outputs: FunctionCallOutput[]) => void;
+      }
+    ).commitToolCallOutputs.bind(activity);
+
+    commitToolCallOutputs([output]);
+    commitToolCallOutputs([output]);
+
+    expect(chatCtx.items).toEqual([output]);
+    expect(toolItemsAdded).toHaveBeenCalledTimes(1);
+    expect(toolItemsAdded).toHaveBeenCalledWith([output]);
+  });
+
   it('preserves completed outputs without starting a tool-reply generation', () => {
     const generateReply = vi.fn();
     const toolItemsAdded = vi.fn();

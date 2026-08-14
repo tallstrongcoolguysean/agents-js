@@ -342,6 +342,7 @@ export class AgentActivity implements RecognitionHooks {
   private toolChoice: ToolChoice | null = null;
   private _preemptiveGeneration?: PreemptiveGeneration;
   private _preemptiveGenerationCount = 0;
+  private committedToolOutputs = new WeakSet<FunctionCallOutput>();
   private _toolsetsSetup = false;
   // True only during the initial, awaited `setupToolsets()` window. While set, a toolset that
   // pushes tools synchronously from its `setup()` must NOT trigger a callback-driven
@@ -1926,6 +1927,24 @@ export class AgentActivity implements RecognitionHooks {
     return task;
   }
 
+  private commitToolCallOutputs(outputs: FunctionCallOutput[]): void {
+    this.committedToolOutputs ??= new WeakSet<FunctionCallOutput>();
+    const uncommitted = outputs.filter(
+      (output) =>
+        !this.committedToolOutputs.has(output) &&
+        this.agent._chatCtx.getById(output.id) === undefined,
+    );
+    if (uncommitted.length === 0) {
+      return;
+    }
+
+    for (const output of uncommitted) {
+      this.committedToolOutputs.add(output);
+    }
+    this.agent._chatCtx.insert(uncommitted);
+    this.agentSession._toolItemsAdded(uncommitted);
+  }
+
   async onEndOfTurn(info: EndOfTurnInfo): Promise<boolean> {
     // When AMD has taken over the turn with a machine verdict, the caller drives
     // its own reply (e.g. leaving a voicemail). Cancel any post-verdict preemptive
@@ -2966,9 +2985,7 @@ export class AgentActivity implements RecognitionHooks {
     }
 
     if (speechHandle.interrupted) {
-      replyAbortController.abort(
-        new Error('speech handle interrupted before pipeline synthesis'),
-      );
+      replyAbortController.abort(new Error('speech handle interrupted before pipeline synthesis'));
       await cancelAndWait(tasks, REPLY_TASK_CANCEL_TIMEOUT);
       return;
     }
@@ -3160,6 +3177,9 @@ export class AgentActivity implements RecognitionHooks {
     const onToolExecutionCompleted = (out: ToolExecutionOutput) => {
       if (out.toolCallOutput) {
         speechHandle._itemAdded([out.toolCallOutput]);
+        if (out.agentTask === undefined) {
+          this.commitToolCallOutputs([out.toolCallOutput]);
+        }
       }
     };
 
@@ -3224,6 +3244,12 @@ export class AgentActivity implements RecognitionHooks {
     // add the tools messages that triggers this reply to the chat context
     if (toolsMessages) {
       for (const msg of toolsMessages) {
+        if (
+          msg.type === 'function_call_output' &&
+          this.agent._chatCtx.getById(msg.id) !== undefined
+        ) {
+          continue;
+        }
         msg.createdAt = replyStartedAt;
       }
       // Only insert FunctionCallOutput items into agent._chatCtx since FunctionCall items
@@ -3233,10 +3259,7 @@ export class AgentActivity implements RecognitionHooks {
       const toolCallOutputs = toolsMessages.filter(
         (m): m is FunctionCallOutput => m.type === 'function_call_output',
       );
-      if (toolCallOutputs.length > 0) {
-        this.agent._chatCtx.insert(toolCallOutputs);
-        this.agentSession._toolItemsAdded(toolCallOutputs);
-      }
+      this.commitToolCallOutputs(toolCallOutputs);
     }
 
     if (speechHandle.interrupted) {
@@ -3245,9 +3268,7 @@ export class AgentActivity implements RecognitionHooks {
         'Aborting all pipeline reply tasks due to interruption',
       );
 
-      replyAbortController.abort(
-        new Error('speech handle interrupted during pipeline generation'),
-      );
+      replyAbortController.abort(new Error('speech handle interrupted during pipeline generation'));
       await cancelAndWait(tasks, REPLY_TASK_CANCEL_TIMEOUT);
 
       const forwardedText = segmentOutputs.map(forwardedTextFor).join('');
@@ -3418,10 +3439,7 @@ export class AgentActivity implements RecognitionHooks {
         (m): m is FunctionCallOutput => m.type === 'function_call_output',
       );
 
-      if (toolCallOutputs.length > 0) {
-        this.agent._chatCtx.insert(toolCallOutputs);
-        this.agentSession._toolItemsAdded(toolCallOutputs);
-      }
+      this.commitToolCallOutputs(toolCallOutputs);
     }
   };
 
@@ -3843,6 +3861,9 @@ export class AgentActivity implements RecognitionHooks {
     const onToolExecutionCompleted = (out: ToolExecutionOutput) => {
       if (out.toolCallOutput) {
         speechHandle._itemAdded([out.toolCallOutput]);
+        if (out.agentTask === undefined) {
+          this.commitToolCallOutputs([out.toolCallOutput]);
+        }
       }
     };
 
@@ -3967,8 +3988,7 @@ export class AgentActivity implements RecognitionHooks {
       // handoff merges. `agentSession.history` is updated separately by `_toolItemsAdded`.
       const toolCallOutputs =
         functionToolsExecutedEvent.functionCallOutputs as FunctionCallOutput[];
-      this.agent._chatCtx.insert(toolCallOutputs);
-      this.agentSession._toolItemsAdded(toolCallOutputs);
+      this.commitToolCallOutputs(toolCallOutputs);
 
       // If the realtime model auto-generates the tool reply, install a
       // placeholder so the active RunResult waits for that reply.
@@ -4151,13 +4171,13 @@ export class AgentActivity implements RecognitionHooks {
       functionToolsExecutedEvent,
     );
     const outputs = functionToolsExecutedEvent.functionCallOutputs;
-    for (const output of outputs) {
+    const uncommittedOutputs = outputs.filter(
+      (output) => this.agent._chatCtx.getById(output.id) === undefined,
+    );
+    for (const output of uncommittedOutputs) {
       output.createdAt = createdAt;
     }
-    if (outputs.length > 0) {
-      this.agent._chatCtx.insert(outputs);
-      this.agentSession._toolItemsAdded(outputs);
-    }
+    this.commitToolCallOutputs(uncommittedOutputs);
   }
 
   private summarizeToolExecutionOutput(toolOutput: ToolOutput, speechHandle: SpeechHandle) {
