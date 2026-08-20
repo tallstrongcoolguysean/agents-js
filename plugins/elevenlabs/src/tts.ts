@@ -6,7 +6,6 @@ import {
   APIConnectionError,
   APIError,
   APIStatusError,
-  APITimeoutError,
   AudioByteStream,
   type TimedString,
   asError,
@@ -364,8 +363,18 @@ class Connection {
           const content = msg as SynthesizeContent;
           const isNewContext = !this.#activeContexts.has(content.contextId);
 
-          // If not current and this is a new context, ignore it
+          // A non-current connection is being drained; it must not open new contexts.
+          // Fail the stream so the caller can retry on a fresh connection.
           if (!this.#isCurrent && isNewContext) {
+            const staleCtx = this.#contextData.get(content.contextId);
+            if (staleCtx) {
+              staleCtx.waiter.reject(
+                new APIConnectionError({
+                  message: 'ElevenLabs connection was replaced before the context was opened',
+                }),
+              );
+              this.#cleanupContext(content.contextId);
+            }
             continue;
           }
 
@@ -500,7 +509,16 @@ class Connection {
             continue;
           }
 
-          this.#logger.warn({ data }, 'unexpected message received from elevenlabs tts');
+          this.#logger.warn(
+            {
+              context_id: contextId,
+              message_type: data.type,
+              is_final: data.isFinal === true,
+              has_audio: data.audio != null,
+              active_context_ids: [...this.#contextData.keys()],
+            },
+            'received elevenlabs message for an unknown context',
+          );
           continue;
         }
 
@@ -934,6 +952,10 @@ export class SynthesizeStream extends tts.SynthesizeStream {
   #audioQueue: Buffer[] = [];
   #timedTranscriptQueue: TimedString[] = [];
   #streamDone = false;
+  #stalled = false;
+  #stallTimer?: ReturnType<typeof setTimeout>;
+  #stallReject?: (reason: Error) => void;
+  #attempt = 0;
 
   label = 'elevenlabs.SynthesizeStream';
 
@@ -954,18 +976,73 @@ export class SynthesizeStream extends tts.SynthesizeStream {
     if (this.closed || this.abortController.signal.aborted) {
       return;
     }
+    this.#armStallTimer();
     this.#audioQueue.push(data);
   }
 
   pushTimedTranscript(timedWords: TimedString[]): void {
+    this.#armStallTimer();
     this.#timedTranscriptQueue.push(...timedWords);
   }
 
   markDone(): void {
     this.#streamDone = true;
+    this.#clearStallTimer();
+  }
+
+  /**
+   * ElevenLabs signals the end of a context with `isFinal`, and that message is the only
+   * thing that settles the synthesis attempt. When it never arrives the attempt would wait
+   * forever, so every inbound message restarts a timer bounded by `connOptions.timeoutMs`.
+   */
+  #armStallTimer(): void {
+    if (this.#stalled || this.#streamDone || !this.#stallReject) {
+      return;
+    }
+
+    const timeoutMs = this.connOptions.timeoutMs;
+    clearTimeout(this.#stallTimer);
+    this.#stallTimer = setTimeout(() => this.#failStalled(timeoutMs), timeoutMs);
+  }
+
+  #clearStallTimer(): void {
+    clearTimeout(this.#stallTimer);
+    this.#stallTimer = undefined;
+  }
+
+  #failStalled(timeoutMs: number): void {
+    this.#clearStallTimer();
+    if (this.#stalled || this.#streamDone) {
+      return;
+    }
+
+    this.#stalled = true;
+    this.#logger.warn(
+      { context_id: this.#contextId, timeout_ms: timeoutMs },
+      'elevenlabs tts stalled, no data received before the timeout; failing the attempt',
+    );
+    // Not retryable: `input` is consumed once, so a retry would re-send no text and
+    // could only stall again. Surfacing immediately lets a FallbackAdapter take over.
+    this.#stallReject?.(
+      new APIConnectionError({
+        message: `ElevenLabs sent no data for ${timeoutMs}ms`,
+        options: { retryable: false },
+      }),
+    );
   }
 
   protected async run(): Promise<void> {
+    // `run` is re-entered by the base class retry loop, so per-attempt state resets here.
+    // A retry gets a fresh context id: the previous attempt already sent `close_context`
+    // for the old one, and ElevenLabs will not reopen a closed context.
+    if (this.#attempt++ > 0) {
+      this.#contextId = shortuuid();
+    }
+    this.#stalled = false;
+    if (!this.closed) {
+      this.#streamDone = false;
+    }
+
     const requestId = this.#contextId;
     const segmentId = this.#contextId;
     const bstream = new AudioByteStream(this.#opts.sampleRate, 1);
@@ -980,6 +1057,7 @@ export class SynthesizeStream extends tts.SynthesizeStream {
     let waiterReject: ((reason: Error) => void) | undefined;
     const waiterPromise = new Promise<void>((resolve, reject) => {
       waiterReject = reject;
+      this.#stallReject = reject;
       connection.registerStream(this, { resolve, reject });
     });
     let contextClosed = false;
@@ -1058,6 +1136,7 @@ export class SynthesizeStream extends tts.SynthesizeStream {
           text: formattedText,
           flush: flushOnChunk,
         });
+        this.#armStallTimer();
       }
 
       if (xmlContent.length > 0) {
@@ -1066,6 +1145,7 @@ export class SynthesizeStream extends tts.SynthesizeStream {
 
       // Send final empty text to signal end of input
       connection.sendContent({ contextId: this.#contextId, text: '', flush: true });
+      this.#armStallTimer();
       closeContext();
     };
 
@@ -1089,7 +1169,7 @@ export class SynthesizeStream extends tts.SynthesizeStream {
         }
       };
 
-      while (!this.abortController.signal.aborted) {
+      while (!this.abortController.signal.aborted && !this.#stalled) {
         // Drain timed transcript queue
         while (this.#timedTranscriptQueue.length > 0) {
           pendingTimedTranscripts.push(this.#timedTranscriptQueue.shift()!);
@@ -1111,6 +1191,12 @@ export class SynthesizeStream extends tts.SynthesizeStream {
 
         // Small delay to avoid busy waiting
         await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      // A stalled attempt has no end to flush. Emitting the buffered tail here would
+      // mark a truncated segment as `final` on a queue that outlives this attempt.
+      if (this.#stalled) {
+        return;
       }
 
       // Drain any remaining timed transcripts
@@ -1135,14 +1221,22 @@ export class SynthesizeStream extends tts.SynthesizeStream {
         return;
       }
 
-      if (e instanceof APITimeoutError) {
+      // A silent socket is dead for every context on it, not just this one. Retiring it
+      // sends the retry to a fresh websocket instead of the one that stopped answering.
+      if (this.#stalled) {
+        connection.markNonCurrent();
+      }
+
+      // Preserve the original APIError: the caller needs its message and its `retryable`
+      // flag. Anything else is opaque and gets reported as a plain synthesis failure.
+      if (e instanceof APIError) {
         throw e;
       }
-      if (e instanceof APIStatusError) {
-        throw e;
-      }
+
       throw new APIStatusError({ message: 'Could not synthesize' });
     } finally {
+      this.#clearStallTimer();
+      this.#stallReject = undefined;
       closeContext(true);
       // Clean up abort listener
       this.abortController.signal.removeEventListener('abort', abortHandler);
@@ -1154,6 +1248,7 @@ export class SynthesizeStream extends tts.SynthesizeStream {
     this.#audioQueue.length = 0;
     this.#timedTranscriptQueue.length = 0;
     this.#streamDone = true;
+    this.#clearStallTimer();
     this.#sentTokenizerStream.close();
     super.close();
   }

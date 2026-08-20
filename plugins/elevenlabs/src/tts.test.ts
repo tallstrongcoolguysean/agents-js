@@ -259,3 +259,168 @@ describe('ElevenLabs TTS websocket', () => {
     expect(events.length).toBeGreaterThan(0);
   });
 });
+
+describe('ElevenLabs TTS stall watchdog', () => {
+  const audio = Buffer.alloc(4410).toString('base64');
+
+  async function synthesizeWithConnOptions(
+    connOptions: { maxRetry: number; retryIntervalMs: number; timeoutMs: number },
+    sendResponses: (ws: WebSocket, message: Record<string, unknown>, initCount: number) => void,
+  ) {
+    const { wss, baseURL } = await startWebSocketServer();
+    const initPackets: Record<string, unknown>[] = [];
+    let connections = 0;
+
+    wss.on('connection', (ws) => {
+      connections += 1;
+      ws.on('message', (raw) => {
+        const message = JSON.parse(raw.toString()) as Record<string, unknown>;
+        if ('voice_settings' in message) {
+          initPackets.push(message);
+        }
+        sendResponses(ws, message, initPackets.length);
+      });
+    });
+
+    const elevenlabs = new TTS({ apiKey: 'test-key', baseURL });
+    const events: unknown[] = [];
+    const errors: Error[] = [];
+
+    // The base class reports a failed attempt as a `tts_error` on the TTS itself, not on
+    // the stream, and without a listener Node turns it into ERR_UNHANDLED_ERROR.
+    elevenlabs.on('error', (event: { error: Error }) => {
+      errors.push(event.error);
+    });
+
+    const stream = elevenlabs.stream({ connOptions });
+    const outputTask = (async () => {
+      for await (const event of stream) {
+        events.push(event);
+      }
+    })();
+
+    try {
+      stream.pushText('hello world.');
+      stream.endInput();
+      await waitFor(outputTask, 5000);
+
+      return { initPackets, events, errors, connections };
+    } finally {
+      stream.close();
+      await elevenlabs.close();
+      await closeWebSocketServer(wss);
+    }
+  }
+
+  it('fails the attempt when the final message never arrives', async () => {
+    const { events, errors } = await synthesizeWithConnOptions(
+      { maxRetry: 0, retryIntervalMs: 0, timeoutMs: 150 },
+      () => {
+        // Accept the text and go silent, the way a wedged ElevenLabs context does.
+      },
+    );
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!.message).toContain('no data for 150ms');
+    expect(events).toHaveLength(0);
+  });
+
+  it('does not emit a partial segment from a stalled attempt', async () => {
+    const { events, errors } = await synthesizeWithConnOptions(
+      { maxRetry: 0, retryIntervalMs: 0, timeoutMs: 150 },
+      (ws, message) => {
+        // Audio arrives, then the context goes silent without ever sending isFinal.
+        if (!('voice_settings' in message) && message.text) {
+          ws.send(JSON.stringify({ context_id: message.context_id, audio }));
+        }
+      },
+    );
+
+    expect(errors).toHaveLength(1);
+    expect(events).toHaveLength(0);
+  });
+
+  it('does not retry a stall, because the input text cannot be replayed', async () => {
+    const { initPackets, connections, errors } = await synthesizeWithConnOptions(
+      { maxRetry: 3, retryIntervalMs: 0, timeoutMs: 150 },
+      () => {
+        // Never answer.
+      },
+    );
+
+    expect(connections).toBe(1);
+    expect(initPackets).toHaveLength(1);
+    expect(errors).toHaveLength(1);
+  });
+
+  it('retires the silent connection so the next utterance gets a fresh socket', async () => {
+    const { wss, baseURL } = await startWebSocketServer();
+    const connOptions = { maxRetry: 0, retryIntervalMs: 0, timeoutMs: 150 };
+    let connections = 0;
+    let answering = false;
+
+    wss.on('connection', (ws) => {
+      connections += 1;
+      ws.on('message', (raw) => {
+        const message = JSON.parse(raw.toString()) as Record<string, unknown>;
+        if (!answering || 'voice_settings' in message || !message.text) {
+          return;
+        }
+        ws.send(JSON.stringify({ context_id: message.context_id, audio, isFinal: true }));
+      });
+    });
+
+    const elevenlabs = new TTS({ apiKey: 'test-key', baseURL });
+    const errors: Error[] = [];
+    elevenlabs.on('error', (event: { error: Error }) => {
+      errors.push(event.error);
+    });
+
+    const drain = async (stream: ReturnType<TTS['stream']>, text: string) => {
+      const events: unknown[] = [];
+      const task = (async () => {
+        for await (const event of stream) {
+          events.push(event);
+        }
+      })();
+      stream.pushText(text);
+      stream.endInput();
+      await waitFor(task, 5000);
+      stream.close();
+
+      return events;
+    };
+
+    try {
+      const stalledEvents = await drain(elevenlabs.stream({ connOptions }), 'hello world.');
+      expect(stalledEvents).toHaveLength(0);
+      expect(errors).toHaveLength(1);
+      expect(connections).toBe(1);
+
+      // The utterance after a stall must not land on the socket that stopped answering.
+      answering = true;
+      const recoveredEvents = await drain(elevenlabs.stream({ connOptions }), 'hello again.');
+
+      expect(connections).toBe(2);
+      expect(recoveredEvents.length).toBeGreaterThan(0);
+      expect(errors).toHaveLength(1);
+    } finally {
+      await elevenlabs.close();
+      await closeWebSocketServer(wss);
+    }
+  });
+
+  it('leaves a healthy stream untouched', async () => {
+    const { events, errors } = await synthesizeWithConnOptions(
+      { maxRetry: 0, retryIntervalMs: 0, timeoutMs: 1000 },
+      (ws, message) => {
+        if (!('voice_settings' in message) && message.text) {
+          ws.send(JSON.stringify({ context_id: message.context_id, audio, isFinal: true }));
+        }
+      },
+    );
+
+    expect(errors).toHaveLength(0);
+    expect(events.length).toBeGreaterThan(0);
+  });
+});
