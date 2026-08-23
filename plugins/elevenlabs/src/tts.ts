@@ -124,7 +124,6 @@ interface StreamData {
     resolve: (value: void) => void;
     reject: (error: Error) => void;
   };
-  receivedAudio: boolean;
   textBuffer: string;
   startTimesMs: number[];
   durationsMs: number[];
@@ -318,7 +317,6 @@ class Connection {
     this.#contextData.set(contextId, {
       stream,
       waiter,
-      receivedAudio: false,
       textBuffer: '',
       startTimesMs: [],
       durationsMs: [],
@@ -594,27 +592,10 @@ class Connection {
 
         if (data.audio) {
           const audioData = Buffer.from(data.audio as string, 'base64');
-          ctx.receivedAudio = true;
           stream.pushAudio(audioData);
         }
 
         if (data.isFinal) {
-          if (!ctx.receivedAudio) {
-            this.markNonCurrent();
-            ctx.waiter.reject(
-              new APIConnectionError({
-                message: 'ElevenLabs completed the context without returning audio',
-                options: { retryable: true },
-              }),
-            );
-            this.#cleanupContext(contextId!);
-
-            if (this.#activeContexts.size === 0) {
-              break;
-            }
-            continue;
-          }
-
           // Flush remaining alignment data
           if (ctx.textBuffer) {
             const [timedWords] = toTimedWords(

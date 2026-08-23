@@ -125,6 +125,39 @@ async function synthesizeWithMessages(
 }
 
 const hasElevenlabsConfig = Boolean(process.env.ELEVEN_API_KEY && process.env.OPENAI_API_KEY);
+const hasElevenlabsTTSConfig = Boolean(process.env.ELEVEN_API_KEY);
+
+if (hasElevenlabsTTSConfig) {
+  describe('ElevenLabs TTS integration', () => {
+    it('receives audio for a multi-sentence streaming utterance', async () => {
+      const elevenlabs = new TTS({
+        autoMode: true,
+      });
+      const stream = elevenlabs.stream();
+      const events: unknown[] = [];
+      const outputTask = (async () => {
+        for await (const event of stream) {
+          events.push(event);
+        }
+      })();
+
+      try {
+        stream.pushText('Hello. This is a streaming synthesis check.');
+        stream.endInput();
+        await waitFor(outputTask, 15000);
+
+        expect(events.length).toBeGreaterThan(0);
+      } finally {
+        stream.close();
+        await elevenlabs.close();
+      }
+    });
+  });
+} else {
+  describe('ElevenLabs TTS integration', () => {
+    it.skip('requires ELEVEN_API_KEY', () => {});
+  });
+}
 
 if (hasElevenlabsConfig) {
   describe('ElevenLabs', () => {
@@ -378,31 +411,6 @@ describe('ElevenLabs TTS stall watchdog', () => {
 
     expect(errors).toHaveLength(1);
     expect(events).toHaveLength(0);
-  });
-
-  it('retries a final response that contains no audio', async () => {
-    let attempts = 0;
-    const { connections, events, errors } = await synthesizeWithConnOptions(
-      { maxRetry: 1, retryIntervalMs: 0, timeoutMs: 1000 },
-      (ws, message) => {
-        if ('voice_settings' in message || !message.text) {
-          return;
-        }
-
-        attempts += 1;
-        if (attempts === 1) {
-          ws.send(JSON.stringify({ context_id: message.context_id, isFinal: true }));
-          return;
-        }
-
-        ws.send(JSON.stringify({ context_id: message.context_id, audio, isFinal: true }));
-      },
-    );
-
-    expect(connections).toBe(2);
-    expect(attempts).toBe(2);
-    expect(events.length).toBeGreaterThan(0);
-    expect(errors).toHaveLength(0);
   });
 
   it('replays the utterance on a fresh socket after an abnormal close', async () => {
