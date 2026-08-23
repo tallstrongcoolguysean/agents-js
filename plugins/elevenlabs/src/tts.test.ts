@@ -142,7 +142,9 @@ if (hasElevenlabsTTSConfig) {
       })();
 
       try {
-        stream.pushText('Hello. This is a streaming synthesis check.');
+        stream.pushText('Hello.');
+        stream.flush();
+        stream.pushText('This is a streaming synthesis check.');
         stream.endInput();
         await waitFor(outputTask, 15000);
 
@@ -151,7 +153,7 @@ if (hasElevenlabsTTSConfig) {
         stream.close();
         await elevenlabs.close();
       }
-    });
+    }, 20000);
   });
 } else {
   describe('ElevenLabs TTS integration', () => {
@@ -274,6 +276,18 @@ describe('ElevenLabs TTS websocket', () => {
             isFinal: true,
           }),
         );
+      }
+    });
+
+    expect(events.length).toBeGreaterThan(0);
+  });
+
+  it('keeps the context alive when the final packet arrives before audio', async () => {
+    const { events } = await synthesizeWithMessages((ws, messages) => {
+      if (messages.length === 2) {
+        const contextId = messages[0]?.context_id;
+        ws.send(JSON.stringify({ context_id: contextId, isFinal: true }));
+        ws.send(JSON.stringify({ context_id: contextId, audio }));
       }
     });
 
