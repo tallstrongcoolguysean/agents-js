@@ -27,6 +27,8 @@ const DEFAULT_VOICE_ID = 'bIHbv24MWmeRgasZH58o';
 const API_BASE_URL_V1 = 'https://api.elevenlabs.io/v1';
 const AUTHORIZATION_HEADER = 'xi-api-key';
 const WS_INACTIVITY_TIMEOUT = 180;
+const WS_NORMAL_CLOSE_CODE = 1000;
+const WS_CLOSE_TIMEOUT_MS = 1000;
 const DEFAULT_ENCODING: TTSEncoding = 'pcm_22050';
 
 export interface VoiceSettings {
@@ -122,6 +124,7 @@ interface StreamData {
     resolve: (value: void) => void;
     reject: (error: Error) => void;
   };
+  receivedAudio: boolean;
   textBuffer: string;
   startTimesMs: number[];
   durationsMs: number[];
@@ -315,6 +318,7 @@ class Connection {
     this.#contextData.set(contextId, {
       stream,
       waiter,
+      receivedAudio: false,
       textBuffer: '',
       startTimesMs: [],
       durationsMs: [],
@@ -590,10 +594,27 @@ class Connection {
 
         if (data.audio) {
           const audioData = Buffer.from(data.audio as string, 'base64');
+          ctx.receivedAudio = true;
           stream.pushAudio(audioData);
         }
 
         if (data.isFinal) {
+          if (!ctx.receivedAudio) {
+            this.markNonCurrent();
+            ctx.waiter.reject(
+              new APIConnectionError({
+                message: 'ElevenLabs completed the context without returning audio',
+                options: { retryable: true },
+              }),
+            );
+            this.#cleanupContext(contextId!);
+
+            if (this.#activeContexts.size === 0) {
+              break;
+            }
+            continue;
+          }
+
           // Flush remaining alignment data
           if (ctx.textBuffer) {
             const [timedWords] = toTimedWords(
@@ -630,7 +651,7 @@ class Connection {
       this.#ws?.off('close', onClose);
       this.#ws?.off('error', onError);
       if (!this.#closed) {
-        await this.close();
+        await this.#close(true);
       }
     }
   }
@@ -640,7 +661,43 @@ class Connection {
     this.#activeContexts.delete(contextId);
   }
 
-  async close(): Promise<void> {
+  async #closeWebSocket(): Promise<void> {
+    const ws = this.#ws;
+    this.#ws = null;
+    if (!ws || ws.readyState === WebSocket.CLOSED) {
+      return;
+    }
+
+    if (ws.readyState !== WebSocket.OPEN) {
+      ws.terminate();
+      return;
+    }
+
+    const closed = new Promise<void>((resolve) => {
+      ws.once('close', () => resolve());
+    });
+    await new Promise<void>((resolve) => {
+      ws.send(JSON.stringify({ close_socket: true }), () => resolve());
+    });
+    ws.close(WS_NORMAL_CLOSE_CODE, 'client shutdown');
+
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = await Promise.race([
+      closed.then(() => false),
+      new Promise<true>((resolve) => {
+        timeout = setTimeout(() => resolve(true), WS_CLOSE_TIMEOUT_MS);
+      }),
+    ]);
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+    if (timedOut) {
+      ws.terminate();
+      await closed;
+    }
+  }
+
+  async #close(fromReceiveLoop: boolean): Promise<void> {
     if (this.#closed) {
       return;
     }
@@ -653,17 +710,18 @@ class Connection {
     }
     this.#contextData.clear();
 
-    if (this.#ws) {
-      this.#ws.close();
-      this.#ws = null;
-    }
+    await this.#closeWebSocket();
 
     if (this.#sendTask) {
       await this.#sendTask.catch(() => {});
     }
-    if (this.#recvTask) {
+    if (!fromReceiveLoop && this.#recvTask) {
       await this.#recvTask.catch(() => {});
     }
+  }
+
+  async close(): Promise<void> {
+    await this.#close(false);
   }
 }
 
@@ -955,6 +1013,7 @@ export class SynthesizeStream extends tts.SynthesizeStream {
   #stalled = false;
   #stallTimer?: ReturnType<typeof setTimeout>;
   #stallReject?: (reason: Error) => void;
+  #inputBuffer: Array<string | typeof SynthesizeStream.FLUSH_SENTINEL> = [];
   #attempt = 0;
 
   label = 'elevenlabs.SynthesizeStream';
@@ -1021,12 +1080,12 @@ export class SynthesizeStream extends tts.SynthesizeStream {
       { context_id: this.#contextId, timeout_ms: timeoutMs },
       'elevenlabs tts stalled, no data received before the timeout; failing the attempt',
     );
-    // Not retryable: `input` is consumed once, so a retry would re-send no text and
-    // could only stall again. Surfacing immediately lets a FallbackAdapter take over.
+    // The stream keeps a replay buffer, so a fresh connection can retry the same
+    // utterance without asking the caller to generate the text again.
     this.#stallReject?.(
       new APIConnectionError({
         message: `ElevenLabs sent no data for ${timeoutMs}ms`,
-        options: { retryable: false },
+        options: { retryable: true },
       }),
     );
   }
@@ -1035,9 +1094,13 @@ export class SynthesizeStream extends tts.SynthesizeStream {
     // `run` is re-entered by the base class retry loop, so per-attempt state resets here.
     // A retry gets a fresh context id: the previous attempt already sent `close_context`
     // for the old one, and ElevenLabs will not reopen a closed context.
-    if (this.#attempt++ > 0) {
+    const isRetry = this.#attempt++ > 0;
+    if (isRetry) {
       this.#contextId = shortuuid();
+      this.#sentTokenizerStream = this.#opts.wordTokenizer.stream();
     }
+    this.#audioQueue.length = 0;
+    this.#timedTranscriptQueue.length = 0;
     this.#stalled = false;
     if (!this.closed) {
       this.#streamDone = false;
@@ -1090,8 +1153,22 @@ export class SynthesizeStream extends tts.SynthesizeStream {
     this.abortController.signal.addEventListener('abort', abortHandler, { once: true });
 
     const inputTask = async () => {
+      if (isRetry) {
+        for (const data of this.#inputBuffer) {
+          if (this.abortController.signal.aborted) break;
+          if (data === SynthesizeStream.FLUSH_SENTINEL) {
+            this.#sentTokenizerStream.flush();
+          } else {
+            this.#sentTokenizerStream.pushText(data);
+          }
+        }
+        this.#sentTokenizerStream.endInput();
+        return;
+      }
+
       for await (const data of this.input) {
         if (this.abortController.signal.aborted) break;
+        this.#inputBuffer.push(data);
         if (data === SynthesizeStream.FLUSH_SENTINEL) {
           this.#sentTokenizerStream.flush();
           continue;
@@ -1149,6 +1226,7 @@ export class SynthesizeStream extends tts.SynthesizeStream {
       closeContext();
     };
 
+    let attemptFinished = false;
     const audioProcessTask = async () => {
       let lastFrame: AudioFrame | undefined;
       let pendingTimedTranscripts: TimedString[] = [];
@@ -1169,7 +1247,7 @@ export class SynthesizeStream extends tts.SynthesizeStream {
         }
       };
 
-      while (!this.abortController.signal.aborted && !this.#stalled) {
+      while (!this.abortController.signal.aborted && !this.#stalled && !attemptFinished) {
         // Drain timed transcript queue
         while (this.#timedTranscriptQueue.length > 0) {
           pendingTimedTranscripts.push(this.#timedTranscriptQueue.shift()!);
@@ -1195,7 +1273,7 @@ export class SynthesizeStream extends tts.SynthesizeStream {
 
       // A stalled attempt has no end to flush. Emitting the buffered tail here would
       // mark a truncated segment as `final` on a queue that outlives this attempt.
-      if (this.#stalled) {
+      if (this.#stalled || attemptFinished) {
         return;
       }
 
@@ -1213,9 +1291,16 @@ export class SynthesizeStream extends tts.SynthesizeStream {
       sendLastFrame(true);
     };
 
+    const inputPromise = inputTask();
+    const sentenceStreamPromise = sentenceStreamTask();
+    const audioProcessPromise = audioProcessTask();
+
     try {
-      await Promise.all([inputTask(), sentenceStreamTask(), audioProcessTask(), waiterPromise]);
+      await Promise.all([inputPromise, sentenceStreamPromise, audioProcessPromise, waiterPromise]);
     } catch (e) {
+      attemptFinished = true;
+      await Promise.allSettled([inputPromise, sentenceStreamPromise, audioProcessPromise]);
+
       // If aborted, this is a normal termination - don't throw
       if (this.abortController.signal.aborted) {
         return;
@@ -1235,6 +1320,7 @@ export class SynthesizeStream extends tts.SynthesizeStream {
 
       throw new APIStatusError({ message: 'Could not synthesize' });
     } finally {
+      attemptFinished = true;
       this.#clearStallTimer();
       this.#stallReject = undefined;
       closeContext(true);

@@ -175,6 +175,46 @@ describe('ElevenLabs TTS options', () => {
 describe('ElevenLabs TTS websocket', () => {
   const audio = Buffer.alloc(4410).toString('base64');
 
+  it('closes the shared WebSocket with a normal close code', async () => {
+    const { wss, baseURL } = await startWebSocketServer();
+    let resolveCloseCode: ((code: number) => void) | undefined;
+    const closeCode = new Promise<number>((resolve) => {
+      resolveCloseCode = resolve;
+    });
+
+    wss.on('connection', (ws) => {
+      ws.on('close', (code) => resolveCloseCode?.(code));
+      ws.on('message', (raw) => {
+        const message = JSON.parse(raw.toString()) as Record<string, unknown>;
+        if ('voice_settings' in message || !message.text) {
+          return;
+        }
+        ws.send(JSON.stringify({ context_id: message.context_id, audio, isFinal: true }));
+      });
+    });
+
+    const elevenlabs = new TTS({ apiKey: 'test-key', baseURL });
+    const stream = elevenlabs.stream();
+    const outputTask = (async () => {
+      for await (const _event of stream) {
+        // Drain synthesized audio before closing the provider.
+      }
+    })();
+
+    try {
+      stream.pushText('hello world.');
+      stream.endInput();
+      await waitFor(outputTask);
+      await elevenlabs.close();
+
+      expect(await waitFor(closeCode)).toBe(1000);
+    } finally {
+      stream.close();
+      await elevenlabs.close();
+      await closeWebSocketServer(wss);
+    }
+  });
+
   it('accepts snake-case context IDs', async () => {
     const { events } = await synthesizeWithMessages((ws, messages) => {
       if (messages.length === 2) {
@@ -340,17 +380,77 @@ describe('ElevenLabs TTS stall watchdog', () => {
     expect(events).toHaveLength(0);
   });
 
-  it('does not retry a stall, because the input text cannot be replayed', async () => {
-    const { initPackets, connections, errors } = await synthesizeWithConnOptions(
-      { maxRetry: 3, retryIntervalMs: 0, timeoutMs: 150 },
-      () => {
-        // Never answer.
+  it('retries a final response that contains no audio', async () => {
+    let attempts = 0;
+    const { connections, events, errors } = await synthesizeWithConnOptions(
+      { maxRetry: 1, retryIntervalMs: 0, timeoutMs: 1000 },
+      (ws, message) => {
+        if ('voice_settings' in message || !message.text) {
+          return;
+        }
+
+        attempts += 1;
+        if (attempts === 1) {
+          ws.send(JSON.stringify({ context_id: message.context_id, isFinal: true }));
+          return;
+        }
+
+        ws.send(JSON.stringify({ context_id: message.context_id, audio, isFinal: true }));
       },
     );
 
-    expect(connections).toBe(1);
-    expect(initPackets).toHaveLength(1);
-    expect(errors).toHaveLength(1);
+    expect(connections).toBe(2);
+    expect(attempts).toBe(2);
+    expect(events.length).toBeGreaterThan(0);
+    expect(errors).toHaveLength(0);
+  });
+
+  it('replays the utterance on a fresh socket after an abnormal close', async () => {
+    let attempts = 0;
+    const { connections, events, errors } = await synthesizeWithConnOptions(
+      { maxRetry: 1, retryIntervalMs: 0, timeoutMs: 1000 },
+      (ws, message) => {
+        if ('voice_settings' in message || !message.text) {
+          return;
+        }
+
+        attempts += 1;
+        if (attempts === 1) {
+          ws.terminate();
+          return;
+        }
+
+        ws.send(JSON.stringify({ context_id: message.context_id, audio, isFinal: true }));
+      },
+    );
+
+    expect(connections).toBe(2);
+    expect(attempts).toBe(2);
+    expect(events.length).toBeGreaterThan(0);
+    expect(errors).toHaveLength(0);
+  });
+
+  it('replays the utterance on a fresh socket after a stall', async () => {
+    let attempts = 0;
+    const { initPackets, connections, events, errors } = await synthesizeWithConnOptions(
+      { maxRetry: 1, retryIntervalMs: 0, timeoutMs: 150 },
+      (ws, message) => {
+        if ('voice_settings' in message || !message.text) {
+          return;
+        }
+
+        attempts += 1;
+        if (attempts === 2) {
+          ws.send(JSON.stringify({ context_id: message.context_id, audio, isFinal: true }));
+        }
+      },
+    );
+
+    expect(connections).toBe(2);
+    expect(initPackets).toHaveLength(2);
+    expect(attempts).toBe(2);
+    expect(events.length).toBeGreaterThan(0);
+    expect(errors).toHaveLength(0);
   });
 
   it('retires the silent connection so the next utterance gets a fresh socket', async () => {
