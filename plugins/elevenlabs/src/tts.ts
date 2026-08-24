@@ -80,6 +80,17 @@ export interface TTSOptions {
   applyLanguageTextNormalization?: boolean;
   preferredAlignment?: 'normalized' | 'original';
   autoMode?: boolean;
+  /**
+   * Transport used by streaming synthesis. `websocket` preserves incremental
+   * context streaming; `http` synthesizes independent sentences over stateless
+   * HTTP streams.
+   */
+  streamingTransport?: 'websocket' | 'http';
+  /**
+   * Keep an HTTP stream alive when an individual sentence fails. The failure
+   * is emitted as recoverable and later sentences can still synthesize.
+   */
+  continueOnError?: boolean;
   pronunciationDictionaryLocators?: PronunciationDictionaryLocator[];
 }
 
@@ -104,6 +115,8 @@ interface ResolvedTTSOptions {
   applyLanguageTextNormalization?: boolean;
   preferredAlignment: 'normalized' | 'original';
   autoMode: boolean;
+  streamingTransport: 'websocket' | 'http';
+  continueOnError: boolean;
   pronunciationDictionaryLocators?: PronunciationDictionaryLocator[];
 }
 
@@ -717,7 +730,7 @@ class Connection {
 
 export class TTS extends tts.TTS {
   #opts: ResolvedTTSOptions;
-  #streams = new Set<SynthesizeStream>();
+  #streams = new Set<tts.SynthesizeStream>();
   #currentConnection: Connection | null = null;
   #connectionLock = new Mutex();
   #logger = log();
@@ -729,10 +742,11 @@ export class TTS extends tts.TTS {
     const encoding = opts.encoding ?? DEFAULT_ENCODING;
     const sampleRate = sampleRateFromFormat(encoding);
     const syncAlignment = opts.syncAlignment ?? true;
+    const streamingTransport = opts.streamingTransport ?? 'websocket';
 
     super(sampleRate, 1, {
       streaming: true,
-      alignedTranscript: syncAlignment,
+      alignedTranscript: streamingTransport === 'websocket' && syncAlignment,
     });
 
     const apiKey = opts.apiKey ?? process.env.ELEVEN_API_KEY;
@@ -781,8 +795,22 @@ export class TTS extends tts.TTS {
       applyLanguageTextNormalization: opts.applyLanguageTextNormalization,
       preferredAlignment: opts.preferredAlignment ?? 'normalized',
       autoMode,
+      streamingTransport,
+      continueOnError: opts.continueOnError ?? false,
       pronunciationDictionaryLocators: opts.pronunciationDictionaryLocators,
     };
+  }
+
+  reportRecoverableError(error: Error): void {
+    if (this.listenerCount('error') > 0) {
+      this.emit('error', {
+        type: 'tts_error',
+        timestamp: Date.now(),
+        label: this.label,
+        error,
+        recoverable: true,
+      });
+    }
   }
 
   get model(): string {
@@ -871,8 +899,11 @@ export class TTS extends tts.TTS {
     return new ChunkedStream(this, text, { ...this.#opts });
   }
 
-  stream(options?: { connOptions?: APIConnectOptions }): SynthesizeStream {
-    const stream = new SynthesizeStream(this, { ...this.#opts }, options?.connOptions);
+  stream(options?: { connOptions?: APIConnectOptions }): tts.SynthesizeStream {
+    const stream =
+      this.#opts.streamingTransport === 'http'
+        ? new HTTPSynthesizeStream(this, { ...this.#opts }, options?.connOptions)
+        : new SynthesizeStream(this, { ...this.#opts }, options?.connOptions);
     this.#streams.add(stream);
     return stream;
   }
@@ -987,6 +1018,153 @@ export class ChunkedStream extends tts.ChunkedStream {
         return;
       }
       throw new APIConnectionError({ message: `Connection error: ${e}` });
+    }
+  }
+}
+
+export class HTTPSynthesizeStream extends tts.SynthesizeStream {
+  #tts: TTS;
+  #opts: ResolvedTTSOptions;
+  #sentenceStream = new tokenize.basic.SentenceTokenizer().stream();
+
+  label = 'elevenlabs.HTTPSynthesizeStream';
+
+  constructor(tts: TTS, opts: ResolvedTTSOptions, connOptions?: APIConnectOptions) {
+    super(tts, connOptions);
+    this.#tts = tts;
+    this.#opts = opts;
+  }
+
+  protected async run(): Promise<void> {
+    const forwardInput = async () => {
+      for await (const input of this.input) {
+        if (this.abortController.signal.aborted) {
+          break;
+        }
+        if (input === HTTPSynthesizeStream.FLUSH_SENTINEL) {
+          this.#sentenceStream.flush();
+        } else {
+          this.#sentenceStream.pushText(input);
+        }
+      }
+      this.#sentenceStream.endInput();
+    };
+
+    const synthesizeSentences = async () => {
+      for await (const sentence of this.#sentenceStream) {
+        if (this.abortController.signal.aborted) {
+          break;
+        }
+
+        this.markStarted();
+        try {
+          await this.#synthesizeSentence(sentence.token);
+        } catch (error) {
+          if (error instanceof Error && error.name === 'AbortError') {
+            break;
+          }
+          const normalizedError = error instanceof Error ? error : new Error(String(error));
+          if (!this.#opts.continueOnError) {
+            throw normalizedError;
+          }
+          this.#tts.reportRecoverableError(normalizedError);
+        }
+      }
+      this.queue.put(HTTPSynthesizeStream.END_OF_STREAM);
+    };
+
+    try {
+      await Promise.all([forwardInput(), synthesizeSentences()]);
+    } finally {
+      this.#sentenceStream.close();
+    }
+  }
+
+  async #synthesizeSentence(text: string): Promise<void> {
+    const voiceSettings = this.#opts.voiceSettings
+      ? stripUndefined(this.#opts.voiceSettings)
+      : undefined;
+    const extraParams: Record<string, string | boolean> = {};
+    if (this.#opts.language) {
+      extraParams.language_code = getBaseLanguage(this.#opts.language);
+    }
+    if (this.#opts.applyLanguageTextNormalization !== undefined) {
+      extraParams.apply_language_text_normalization = this.#opts.applyLanguageTextNormalization;
+    }
+
+    const url = synthesizeUrl(this.#opts);
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        [AUTHORIZATION_HEADER]: this.#opts.apiKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        text,
+        model_id: this.#opts.model,
+        voice_settings: voiceSettings,
+        apply_text_normalization: this.#opts.applyTextNormalization,
+        ...extraParams,
+      }),
+      signal: this.abortSignal,
+    });
+    if (!response.ok) {
+      throw new APIStatusError({
+        message: `ElevenLabs API error from ${url}: ${await response.text()}`,
+        options: { statusCode: response.status },
+      });
+    }
+
+    const contentType = response.headers.get('content-type') || '';
+    if (!contentType.startsWith('audio/')) {
+      throw new APIError(`ElevenLabs returned non-audio data: ${await response.text()}`);
+    }
+
+    const reader = response.body?.getReader();
+    if (!reader) {
+      throw new APIError('No response body');
+    }
+
+    const requestId = shortuuid();
+    const audioBytes = new AudioByteStream(this.#opts.sampleRate, 1);
+    let lastFrame: AudioFrame | undefined;
+
+    while (!this.abortController.signal.aborted) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      for (const frame of audioBytes.write(value)) {
+        if (lastFrame) {
+          this.queue.put({
+            requestId,
+            segmentId: requestId,
+            frame: lastFrame,
+            final: false,
+          });
+        }
+        lastFrame = frame;
+      }
+    }
+
+    for (const frame of audioBytes.flush()) {
+      if (lastFrame) {
+        this.queue.put({
+          requestId,
+          segmentId: requestId,
+          frame: lastFrame,
+          final: false,
+        });
+      }
+      lastFrame = frame;
+    }
+    if (lastFrame) {
+      this.queue.put({
+        requestId,
+        segmentId: requestId,
+        frame: lastFrame,
+        final: true,
+      });
     }
   }
 }

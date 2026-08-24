@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { type WebSocket, WebSocketServer } from 'ws';
 import { TTS } from './tts.js';
 
@@ -204,6 +204,120 @@ describe('ElevenLabs TTS options', () => {
     });
 
     expect(new URL(`ws://127.0.0.1${requestUrl}`).searchParams.get('auto_mode')).toBe('true');
+  });
+});
+
+describe('ElevenLabs TTS HTTP streaming', () => {
+  const audio = Buffer.alloc(4410);
+
+  it('streams independent sentence requests without aligned transcript coupling', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(audio, {
+        status: 200,
+        headers: { 'Content-Type': 'audio/pcm' },
+      }),
+    );
+    const elevenlabs = new TTS({
+      apiKey: 'test-key',
+      streamingTransport: 'http',
+      continueOnError: true,
+    });
+    const stream = elevenlabs.stream();
+    const events: unknown[] = [];
+
+    try {
+      stream.pushText('First sentence.');
+      stream.flush();
+      stream.pushText('Second sentence.');
+      stream.endInput();
+      for await (const event of stream) {
+        events.push(event);
+      }
+
+      expect(events.length).toBeGreaterThan(0);
+      expect(elevenlabs.capabilities.streaming).toBe(true);
+      expect(elevenlabs.capabilities.alignedTranscript).toBe(false);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      stream.close();
+      await elevenlabs.close();
+      fetchMock.mockRestore();
+    }
+  });
+
+  it('finishes after a recoverable sentence failure', async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response('provider unavailable', { status: 503 }));
+    const elevenlabs = new TTS({
+      apiKey: 'test-key',
+      streamingTransport: 'http',
+      continueOnError: true,
+    });
+    const errors: { recoverable: boolean }[] = [];
+    elevenlabs.on('error', (event) => errors.push(event));
+    const stream = elevenlabs.stream();
+    const events: unknown[] = [];
+
+    try {
+      stream.pushText('This text turn must survive.');
+      stream.endInput();
+      for await (const event of stream) {
+        if (typeof event !== 'symbol') {
+          events.push(event);
+        }
+      }
+
+      expect(events).toHaveLength(0);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]?.recoverable).toBe(true);
+    } finally {
+      stream.close();
+      await elevenlabs.close();
+      fetchMock.mockRestore();
+    }
+  });
+
+  it('aborts only the active HTTP request when interrupted', async () => {
+    let requestAborted = false;
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(
+      async (_input, init) =>
+        await new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            'abort',
+            () => {
+              requestAborted = true;
+              reject(new DOMException('interrupted', 'AbortError'));
+            },
+            { once: true },
+          );
+        }),
+    );
+    const elevenlabs = new TTS({
+      apiKey: 'test-key',
+      streamingTransport: 'http',
+      continueOnError: true,
+    });
+    const stream = elevenlabs.stream();
+    const outputTask = (async () => {
+      for await (const _event of stream) {
+        // Interrupted synthesis must not emit late frames.
+      }
+    })();
+
+    try {
+      stream.pushText('This sentence will be interrupted.');
+      stream.endInput();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      stream.close();
+      await outputTask;
+
+      expect(requestAborted).toBe(true);
+    } finally {
+      stream.close();
+      await elevenlabs.close();
+      fetchMock.mockRestore();
+    }
   });
 });
 
