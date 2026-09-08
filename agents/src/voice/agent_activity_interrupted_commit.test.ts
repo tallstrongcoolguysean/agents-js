@@ -9,6 +9,7 @@ import { Future } from '../utils.js';
 import { Agent } from './agent.js';
 import { AgentSession } from './agent_session.js';
 import { AgentSessionEventTypes, type ConversationItemAddedEvent } from './events.js';
+import { forwardedTextFor } from './generation.js';
 import { AudioOutput } from './io.js';
 import { FakeLLM } from './testing/fake_llm.js';
 
@@ -192,6 +193,35 @@ class NoFrameAgent extends Agent {
 
 describe('AgentActivity interrupted-speech commit', () => {
   initializeLogger({ pretty: false, level: 'silent' });
+
+  it('preserves an empty synchronized transcript for an early interruption', () => {
+    const text = forwardedTextFor({
+      played: 'partial',
+      textOut: {
+        text: 'The complete generated response.',
+        firstTextFut: new Future(),
+      },
+      synchronizedTranscript: '',
+      audioOut: null,
+      playbackPositionInS: 0,
+    });
+
+    expect(text).toBe('');
+  });
+
+  it('falls back to generated text for a non-aligned output', () => {
+    const text = forwardedTextFor({
+      played: 'partial',
+      textOut: {
+        text: 'The complete generated response.',
+        firstTextFut: new Future(),
+      },
+      audioOut: null,
+      playbackPositionInS: 0.02,
+    });
+
+    expect(text).toBe('The complete generated response.');
+  });
 
   it('commits an interrupted reply to chat ctx when no synchronized transcript is available', async () => {
     const session = new AgentSession({

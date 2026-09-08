@@ -966,14 +966,14 @@ export interface _AudioOut {
 /**
  * The text that actually reached the user, accounting for interruptions.
  *
- * On a mid-playout interruption (`played === 'partial'`) we prefer the
- * playback-aligned `synchronizedTranscript`, but fall back to the full generated
- * text when no synchronized transcript is available (e.g. avatar outputs) so the
- * heard reply is still committed to chat ctx rather than dropped.
+ * On a mid-playout interruption (`played === 'partial'`), an empty synchronized
+ * transcript means playback stopped before a complete word reached the user.
+ * `undefined` means the output cannot provide synchronization, so non-aligned
+ * outputs fall back to their generated text.
  */
 export function forwardedTextFor(output: ForwardOutput): string {
   if (output.played === 'skipped') return '';
-  if (output.played === 'partial' && output.synchronizedTranscript) {
+  if (output.played === 'partial' && output.synchronizedTranscript !== undefined) {
     return output.synchronizedTranscript;
   }
   return output.textOut?.text ?? '';

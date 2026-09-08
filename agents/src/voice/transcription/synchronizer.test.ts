@@ -247,6 +247,49 @@ describe('TranscriptionSynchronizer enabled behavior', () => {
     expect(downstream.captured).toEqual(['hello']);
     await synchronizer.close();
   });
+
+  it('includes a delivered word in an interruption snapshot', async () => {
+    class PlayingAudioOutput extends AudioOutput {
+      constructor() {
+        super(8000);
+      }
+
+      async captureFrame(frame: AudioFrame): Promise<void> {
+        await super.captureFrame(frame);
+        this.onPlaybackStarted(Date.now());
+      }
+
+      clearBuffer(): void {
+        this.onPlaybackFinished({ playbackPosition: 0.02, interrupted: true });
+      }
+    }
+
+    class InterruptingTextOutput extends TextOutput {
+      onText?: () => void;
+
+      async captureText(_text: string): Promise<void> {
+        this.onText?.();
+      }
+
+      flush(): void {}
+    }
+
+    const audioOutput = new PlayingAudioOutput();
+    const textOutput = new InterruptingTextOutput();
+    const synchronizer = new TranscriptionSynchronizer(audioOutput, textOutput);
+    textOutput.onText = () => audioOutput.clearBuffer();
+
+    await synchronizer.audioOutput.captureFrame(
+      new AudioFrame(new Int16Array(8000), 8000, 1, 8000),
+    );
+    await synchronizer.textOutput.captureText('hello');
+    synchronizer.textOutput.flush();
+
+    const event = await synchronizer.audioOutput.waitForPlayout();
+    expect(event.interrupted).toBe(true);
+    expect(event.synchronizedTranscript).toBe('hello');
+    await synchronizer.close();
+  });
 });
 
 describe('TranscriptionSynchronizer attachment warnings', () => {

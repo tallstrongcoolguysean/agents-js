@@ -488,10 +488,9 @@ class SegmentSynchronizerImpl {
           endTime: this.synchronizedElapsedSeconds(),
         }),
       );
-      await this.sleepIfNotClosed(delayTime / 2);
-
       this.textData.forwardedHyphens += wordHyphens;
       this.textData.forwardedText += forwardedWord;
+      await this.sleepIfNotClosed(delayTime / 2);
     }
 
     if (pushedTextCursor < this.textData.pushedText.length) {
