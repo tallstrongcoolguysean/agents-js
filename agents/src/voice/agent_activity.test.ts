@@ -1661,3 +1661,60 @@ describe('AgentActivity - preemptive generation reconciliation', () => {
     expect(harness.speculativeMessage.transcriptConfidence).toBe(0.42);
   });
 });
+
+describe('AgentActivity - interrupted turn ordering', () => {
+  it('finalizes interrupted speech before copying context for the next reply', async () => {
+    const currentSpeech = SpeechHandle.create();
+    const assistantMessage = ChatMessage.create({
+      role: 'assistant',
+      content: 'The part the user already heard.',
+      interrupted: true,
+    });
+    const chatCtx = new ChatContext();
+    const callbackContexts: ChatContext[] = [];
+    const nextSpeech = SpeechHandle.create();
+    const generateReply = vi.fn(() => nextSpeech);
+    const fakeActivity = {
+      _preemptiveGenerationCount: 0,
+      _preemptiveGeneration: undefined,
+      _currentSpeech: currentSpeech,
+      schedulingPaused: false,
+      newTurnsBlocked: false,
+      llm: new FakePreemptiveLLM(),
+      tools: ToolContext.empty(),
+      toolChoice: null,
+      cancelSpeechPause: async () => {},
+      realtimeSession: undefined,
+      agent: {
+        chatCtx,
+        onUserTurnCompleted: async (context: ChatContext) => {
+          callbackContexts.push(context);
+        },
+      },
+      agentSession: { emit: vi.fn() },
+      logger: { info() {}, debug() {}, warn() {}, error() {} },
+      generateReply,
+    };
+    Object.setPrototypeOf(fakeActivity, AgentActivity.prototype);
+
+    const userTurnCompleted = (AgentActivity.prototype as unknown as Record<string, unknown>)
+      .userTurnCompleted as (this: unknown, info: unknown) => Promise<void>;
+    const completion = userTurnCompleted.call(fakeActivity, {
+      newTranscript: 'Tell me about the brain.',
+      transcriptConfidence: 1,
+      skipReply: false,
+    });
+
+    await Promise.resolve();
+    expect(callbackContexts).toHaveLength(0);
+    expect(generateReply).not.toHaveBeenCalled();
+
+    chatCtx.insert(assistantMessage);
+    currentSpeech._markDone();
+    await completion;
+
+    expect(callbackContexts).toHaveLength(1);
+    expect(callbackContexts[0]?.items).toContain(assistantMessage);
+    expect(generateReply).toHaveBeenCalledOnce();
+  });
+});

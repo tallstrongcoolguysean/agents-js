@@ -2468,6 +2468,7 @@ export class AgentActivity implements RecognitionHooks {
 
       currentSpeech.interrupt();
       this.realtimeSession?.interrupt();
+      await currentSpeech.waitForPlayout();
     }
 
     let userMessage: ChatMessage | undefined = ChatMessage.create({
