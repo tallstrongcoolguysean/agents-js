@@ -398,15 +398,14 @@ class Connection {
           }
 
           if (isNewContext) {
-            const voiceSettings = this.#opts.voiceSettings
-              ? stripUndefined(this.#opts.voiceSettings)
-              : {};
-
             const initPkt: Record<string, unknown> = {
               text: ' ',
-              voice_settings: voiceSettings,
               context_id: content.contextId,
             };
+
+            if (this.#opts.voiceSettings) {
+              initPkt.voice_settings = stripUndefined(this.#opts.voiceSettings);
+            }
 
             if (this.#opts.chunkLengthSchedule) {
               initPkt.generation_config = {
@@ -510,12 +509,23 @@ class Connection {
             { context_id: contextId, error: data.error, data },
             'elevenlabs tts returned error',
           );
-          if (contextId) {
-            if (ctx) {
-              ctx.waiter.reject(new APIError(data.error as string));
-            }
-            this.#cleanupContext(contextId);
+          const errorMessage =
+            typeof data.message === 'string'
+              ? data.message
+              : typeof data.error === 'string'
+                ? data.error
+                : 'ElevenLabs websocket request failed';
+
+          if (data.error === 'protocol_violation' || !contextId) {
+            throw new APIConnectionError({
+              message: `ElevenLabs websocket error: ${errorMessage}`,
+            });
           }
+
+          if (ctx) {
+            ctx.waiter.reject(new APIError(errorMessage));
+          }
+          this.#cleanupContext(contextId);
           continue;
         }
 

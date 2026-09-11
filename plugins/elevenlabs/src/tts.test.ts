@@ -5,7 +5,7 @@ import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import { describe, expect, it, vi } from 'vitest';
 import { type WebSocket, WebSocketServer } from 'ws';
-import { TTS } from './tts.js';
+import { TTS, type VoiceSettings } from './tts.js';
 
 async function startWebSocketServer() {
   const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 });
@@ -44,7 +44,11 @@ async function waitFor<T>(promise: Promise<T>, timeoutMs = 1000): Promise<T> {
   }
 }
 
-async function captureStreamInit(opts: { chunkLengthSchedule?: number[]; autoMode?: boolean }) {
+async function captureStreamInit(opts: {
+  chunkLengthSchedule?: number[];
+  autoMode?: boolean;
+  voiceSettings?: VoiceSettings;
+}) {
   const { wss, baseURL } = await startWebSocketServer();
   const messages: Record<string, unknown>[] = [];
   let requestUrl = '';
@@ -66,6 +70,7 @@ async function captureStreamInit(opts: { chunkLengthSchedule?: number[]; autoMod
     baseURL,
     chunkLengthSchedule: opts.chunkLengthSchedule,
     autoMode: opts.autoMode,
+    voiceSettings: opts.voiceSettings,
   });
   const stream = elevenlabs.stream();
 
@@ -195,6 +200,20 @@ describe('ElevenLabs TTS options', () => {
 
     expect(initPacket).not.toHaveProperty('generation_config');
     expect(new URL(`ws://127.0.0.1${requestUrl}`).searchParams.get('auto_mode')).toBe('true');
+  });
+
+  it('omits voice settings when they are not configured', async () => {
+    const { initPacket } = await captureStreamInit({});
+
+    expect(initPacket).not.toHaveProperty('voice_settings');
+  });
+
+  it('includes configured voice settings in the context init packet', async () => {
+    const { initPacket } = await captureStreamInit({
+      voiceSettings: { stability: 0.5, similarity_boost: 0.75 },
+    });
+
+    expect(initPacket.voice_settings).toEqual({ stability: 0.5, similarity_boost: 0.75 });
   });
 
   it('respects explicit autoMode with chunk length schedule', async () => {
@@ -335,7 +354,7 @@ describe('ElevenLabs TTS websocket', () => {
       ws.on('close', (code) => resolveCloseCode?.(code));
       ws.on('message', (raw) => {
         const message = JSON.parse(raw.toString()) as Record<string, unknown>;
-        if ('voice_settings' in message || !message.text) {
+        if (message.text === ' ' || !message.text) {
           return;
         }
         ws.send(JSON.stringify({ context_id: message.context_id, audio, isFinal: true }));
@@ -476,7 +495,7 @@ describe('ElevenLabs TTS stall watchdog', () => {
       connections += 1;
       ws.on('message', (raw) => {
         const message = JSON.parse(raw.toString()) as Record<string, unknown>;
-        if ('voice_settings' in message) {
+        if (message.text === ' ') {
           initPackets.push(message);
         }
         sendResponses(ws, message, initPackets.length);
@@ -531,7 +550,7 @@ describe('ElevenLabs TTS stall watchdog', () => {
       { maxRetry: 0, retryIntervalMs: 0, timeoutMs: 150 },
       (ws, message) => {
         // Audio arrives, then the context goes silent without ever sending isFinal.
-        if (!('voice_settings' in message) && message.text) {
+        if (message.text !== ' ' && message.text) {
           ws.send(JSON.stringify({ context_id: message.context_id, audio }));
         }
       },
@@ -546,7 +565,7 @@ describe('ElevenLabs TTS stall watchdog', () => {
     const { connections, events, errors } = await synthesizeWithConnOptions(
       { maxRetry: 1, retryIntervalMs: 0, timeoutMs: 1000 },
       (ws, message) => {
-        if ('voice_settings' in message || !message.text) {
+        if (message.text === ' ' || !message.text) {
           return;
         }
 
@@ -566,12 +585,44 @@ describe('ElevenLabs TTS stall watchdog', () => {
     expect(errors).toHaveLength(0);
   });
 
+  it('replays the utterance on a fresh socket after a protocol violation', async () => {
+    let attempts = 0;
+    const { connections, events, errors } = await synthesizeWithConnOptions(
+      { maxRetry: 1, retryIntervalMs: 0, timeoutMs: 1000 },
+      (ws, message) => {
+        if (message.text === ' ' || !message.text) {
+          return;
+        }
+
+        attempts += 1;
+        if (attempts === 1) {
+          ws.send(
+            JSON.stringify({
+              context_id: message.context_id,
+              error: 'protocol_violation',
+              message:
+                'voice_settings field must be provided in the first message and then either be not provided or not change.',
+            }),
+          );
+          return;
+        }
+
+        ws.send(JSON.stringify({ context_id: message.context_id, audio, isFinal: true }));
+      },
+    );
+
+    expect(connections).toBe(2);
+    expect(attempts).toBe(2);
+    expect(events.length).toBeGreaterThan(0);
+    expect(errors).toHaveLength(0);
+  });
+
   it('replays the utterance on a fresh socket after a stall', async () => {
     let attempts = 0;
     const { initPackets, connections, events, errors } = await synthesizeWithConnOptions(
       { maxRetry: 1, retryIntervalMs: 0, timeoutMs: 150 },
       (ws, message) => {
-        if ('voice_settings' in message || !message.text) {
+        if (message.text === ' ' || !message.text) {
           return;
         }
 
@@ -599,7 +650,7 @@ describe('ElevenLabs TTS stall watchdog', () => {
       connections += 1;
       ws.on('message', (raw) => {
         const message = JSON.parse(raw.toString()) as Record<string, unknown>;
-        if (!answering || 'voice_settings' in message || !message.text) {
+        if (!answering || message.text === ' ' || !message.text) {
           return;
         }
         ws.send(JSON.stringify({ context_id: message.context_id, audio, isFinal: true }));
@@ -650,7 +701,7 @@ describe('ElevenLabs TTS stall watchdog', () => {
     const { events, errors } = await synthesizeWithConnOptions(
       { maxRetry: 0, retryIntervalMs: 0, timeoutMs: 1000 },
       (ws, message) => {
-        if (!('voice_settings' in message) && message.text) {
+        if (message.text !== ' ' && message.text) {
           ws.send(JSON.stringify({ context_id: message.context_id, audio, isFinal: true }));
         }
       },
