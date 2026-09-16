@@ -85,6 +85,8 @@ export interface SessionConnectOptions {
   ttsConnOptions?: Partial<APIConnectOptions>;
   /** Maximum number of consecutive unrecoverable errors from LLM or TTS before closing the session. Default: 3 */
   maxUnrecoverableErrors?: number;
+  /** Whether exhausted TTS retries can close the agent session. Default: true */
+  closeOnUnrecoverableTtsError?: boolean;
 }
 
 /**
@@ -96,6 +98,7 @@ export interface ResolvedSessionConnectOptions {
   llmConnOptions: APIConnectOptions;
   ttsConnOptions: APIConnectOptions;
   maxUnrecoverableErrors: number;
+  closeOnUnrecoverableTtsError: boolean;
 }
 
 export const DEFAULT_SESSION_CONNECT_OPTIONS: ResolvedSessionConnectOptions = {
@@ -103,4 +106,5 @@ export const DEFAULT_SESSION_CONNECT_OPTIONS: ResolvedSessionConnectOptions = {
   llmConnOptions: DEFAULT_API_CONNECT_OPTIONS,
   ttsConnOptions: DEFAULT_API_CONNECT_OPTIONS,
   maxUnrecoverableErrors: 3,
+  closeOnUnrecoverableTtsError: true,
 };

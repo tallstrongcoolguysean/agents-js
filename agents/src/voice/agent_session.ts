@@ -542,6 +542,9 @@ export class AgentSession<
       maxUnrecoverableErrors:
         connOptions?.maxUnrecoverableErrors ??
         DEFAULT_SESSION_CONNECT_OPTIONS.maxUnrecoverableErrors,
+      closeOnUnrecoverableTtsError:
+        connOptions?.closeOnUnrecoverableTtsError ??
+        DEFAULT_SESSION_CONNECT_OPTIONS.closeOnUnrecoverableTtsError,
     };
 
     // VAD: undefined → auto-provision bundled inference.VAD (silero). The
@@ -1552,6 +1555,10 @@ export class AgentSession<
         return;
       }
     } else if (error.type === 'tts_error') {
+      if (!this._connOptions.closeOnUnrecoverableTtsError) {
+        return;
+      }
+
       this.ttsErrorCounts += 1;
       if (this.ttsErrorCounts <= this._connOptions.maxUnrecoverableErrors) {
         return;

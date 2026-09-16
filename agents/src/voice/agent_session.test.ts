@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { ParticipantKind, type RemoteParticipant } from '@livekit/rtc-node';
 import { describe, expect, it, vi } from 'vitest';
+import type { TTSError } from '../tts/index.js';
 import { AgentSession, resolveRecordingOptions } from './agent_session.js';
 import { AgentSessionEventTypes, createUserInputTranscribedEvent } from './events.js';
 import { SpeechHandle } from './speech_handle.js';
@@ -166,6 +167,30 @@ describe('AgentSession close lifecycle', () => {
     expect(roomIO.close).toHaveBeenCalledTimes(1);
     expect(ctx._primaryAgentSession).toBeUndefined();
     expect(internals.started).toBe(false);
+  });
+});
+
+describe('AgentSession TTS error policy', () => {
+  it('keeps the session open when unrecoverable TTS errors are non-fatal', () => {
+    const session = new AgentSession({
+      vad: null,
+      connOptions: { closeOnUnrecoverableTtsError: false },
+    });
+    const error = {
+      type: 'tts_error',
+      timestamp: Date.now(),
+      label: 'test.TTS',
+      error: new Error('no audio'),
+      recoverable: false,
+    } satisfies TTSError;
+    const onClose = vi.fn();
+    session.on(AgentSessionEventTypes.Close, onClose);
+
+    for (let count = 0; count < 10; count += 1) {
+      session._onError(error);
+    }
+
+    expect(onClose).not.toHaveBeenCalled();
   });
 });
 
