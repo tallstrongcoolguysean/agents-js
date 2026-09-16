@@ -781,6 +781,7 @@ export function performTTSInference(
     let ttsStreamReader: ReadableStreamDefaultReader<AudioFrame> | null = null;
     let ttsStream: ReadableStream<AudioFrame> | null = null;
     let firstByteReceived = false;
+    let cancelReason: unknown;
 
     try {
       const ttsInput = textTransforms
@@ -840,7 +841,11 @@ export function performTTSInference(
       }
     } catch (error) {
       if (error instanceof IdleTimeoutError) {
-        logger.warn('TTS stream stalled after producing audio, forcing close');
+        cancelReason = error;
+        logger.warn(
+          { received_audio: firstByteReceived, timeout_ms: readIdleTimeout },
+          'TTS stream stalled, cancelling provider stream',
+        );
       } else if (error instanceof DOMException && error.name === 'AbortError') {
         return;
       } else {
@@ -851,7 +856,7 @@ export function performTTSInference(
         timedTextsFut.resolve(null);
       }
       ttsStreamReader?.releaseLock();
-      await ttsStream?.cancel();
+      await ttsStream?.cancel(cancelReason);
       await outputWriter.close();
       await timedTextsWriter.close();
     }

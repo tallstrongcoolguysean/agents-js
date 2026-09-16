@@ -578,8 +578,8 @@ export abstract class SynthesizeStream
   }
 
   /** Close both the input and output of the TTS stream */
-  close() {
-    this.abortController.abort();
+  close(reason?: unknown) {
+    this.abortController.abort(reason);
   }
 
   [Symbol.asyncIterator](): SynthesizeStream {

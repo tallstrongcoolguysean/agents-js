@@ -533,10 +533,10 @@ export class Agent<UserData = any> {
       stream.updateInputStream(input);
 
       let cleaned = false;
-      const cleanup = async () => {
+      const cleanup = async (reason?: unknown) => {
         if (cleaned) return;
         cleaned = true;
-        stream.close();
+        stream.close(reason);
         await input.cancel('tts node cleanup').catch(() => {});
         if (wrappedTts !== activity.tts) {
           await wrappedTts.close();
@@ -561,8 +561,8 @@ export class Agent<UserData = any> {
             await cleanup();
           }
         },
-        cancel() {
-          return cleanup();
+        cancel(reason) {
+          return cleanup(reason);
         },
       });
     },

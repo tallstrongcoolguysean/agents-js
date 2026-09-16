@@ -53,6 +53,8 @@ export interface PronunciationDictionaryLocator {
 
 export interface TTSOptions {
   apiKey?: string;
+  /** Application session identifier included in connection diagnostics. */
+  sessionId?: string;
   // New interface
   voiceId?: string;
   voiceSettings?: VoiceSettings;
@@ -97,6 +99,7 @@ export interface TTSOptions {
 // Internal options type with resolved defaults
 interface ResolvedTTSOptions {
   apiKey: string;
+  sessionId?: string;
   voiceId: string;
   voiceSettings?: VoiceSettings;
   model: TTSModels | string;
@@ -277,6 +280,7 @@ class Connection {
   #sendTask: Promise<void> | null = null;
   #recvTask: Promise<void> | null = null;
   #closed = false;
+  #closeInitiator = 'provider';
   #logger = log();
   #inputQueueResolver: (() => void) | null = null;
 
@@ -300,7 +304,7 @@ class Connection {
     this.#isCurrent = false;
   }
 
-  async connect(): Promise<void> {
+  async connect(timeoutMs = 10_000): Promise<void> {
     if (this.#ws || this.#closed) {
       return;
     }
@@ -309,7 +313,7 @@ class Connection {
     const headers = { [AUTHORIZATION_HEADER]: this.#opts.apiKey };
 
     return new Promise((resolve, reject) => {
-      this.#ws = new WebSocket(url, { headers });
+      this.#ws = new WebSocket(url, { headers, handshakeTimeout: timeoutMs });
 
       this.#ws.on('open', () => {
         this.#sendTask = this.#sendLoop();
@@ -339,6 +343,12 @@ class Connection {
       durationsMs: [],
       firstWordOffsetMs: null,
     });
+  }
+
+  unregisterStream(contextId: string): void {
+    this.#contextData.delete(contextId);
+    // The queued close still needs activeContexts to send its close_context packet.
+    // Remove the wire context only after that packet is sent.
   }
 
   sendContent(content: SynthesizeContent): void {
@@ -380,6 +390,8 @@ class Connection {
         if ('text' in msg) {
           // SynthesizeContent
           const content = msg as SynthesizeContent;
+          // An interrupted stream may have queued text that has not reached the wire.
+          if (!this.#contextData.has(content.contextId)) continue;
           const isNewContext = !this.#activeContexts.has(content.contextId);
 
           // A non-current connection is being drained; it must not open new contexts.
@@ -446,6 +458,7 @@ class Connection {
             };
             const closePktStr = JSON.stringify(closePkt);
             this.#ws.send(closePktStr);
+            this.#activeContexts.delete(closeMsg.contextId);
           }
         }
       }
@@ -472,7 +485,17 @@ class Connection {
       }
     };
 
-    const onClose = (code: number) => {
+    const onClose = (code: number, reason: Buffer) => {
+      this.#logger.info(
+        {
+          session_id: this.#opts.sessionId,
+          code,
+          reason: reason.toString(),
+          close_initiator: this.#closed ? this.#closeInitiator : 'provider',
+          active_context_count: this.#contextData.size,
+        },
+        'ElevenLabs websocket closed',
+      );
       if (!this.#closed && this.#contextData.size > 0) {
         messageChannel.abort(
           new APIStatusError({
@@ -552,6 +575,10 @@ class Connection {
         }
 
         const stream = ctx.stream;
+        if (data.type === 'flush_done') {
+          stream.markFlushed();
+          continue;
+        }
 
         // Process alignment data
         const alignment =
@@ -664,7 +691,7 @@ class Connection {
       this.#ws?.off('close', onClose);
       this.#ws?.off('error', onError);
       if (!this.#closed) {
-        await this.#close(true);
+        await this.#close(true, 'connection_retired');
       }
     }
   }
@@ -710,12 +737,13 @@ class Connection {
     }
   }
 
-  async #close(fromReceiveLoop: boolean): Promise<void> {
+  async #close(fromReceiveLoop: boolean, closeInitiator = 'session_shutdown'): Promise<void> {
     if (this.#closed) {
       return;
     }
 
     this.#closed = true;
+    this.#closeInitiator = closeInitiator;
     this.#inputQueueResolver?.();
 
     for (const ctx of this.#contextData.values()) {
@@ -733,14 +761,15 @@ class Connection {
     }
   }
 
-  async close(): Promise<void> {
-    await this.#close(false);
+  async close(closeInitiator = 'session_shutdown'): Promise<void> {
+    await this.#close(false, closeInitiator);
   }
 }
 
 export class TTS extends tts.TTS {
   #opts: ResolvedTTSOptions;
   #streams = new Set<tts.SynthesizeStream>();
+  #closed = false;
   #currentConnection: Connection | null = null;
   #connectionLock = new Mutex();
   #logger = log();
@@ -787,6 +816,7 @@ export class TTS extends tts.TTS {
 
     this.#opts = {
       apiKey,
+      sessionId: opts.sessionId,
       voiceId,
       voiceSettings,
       model,
@@ -885,9 +915,10 @@ export class TTS extends tts.TTS {
     }
   }
 
-  async currentConnection(): Promise<Connection> {
+  async currentConnection(timeoutMs?: number): Promise<Connection> {
     const unlock = await this.#connectionLock.lock();
     try {
+      if (this.#closed) throw new APIConnectionError({ message: 'ElevenLabs TTS is closed' });
       if (
         this.#currentConnection &&
         this.#currentConnection.isCurrent &&
@@ -897,7 +928,11 @@ export class TTS extends tts.TTS {
       }
 
       const conn = new Connection({ ...this.#opts });
-      await conn.connect();
+      await conn.connect(timeoutMs);
+      if (this.#closed) {
+        await conn.close();
+        throw new APIConnectionError({ message: 'ElevenLabs TTS closed while connecting' });
+      }
       this.#currentConnection = conn;
       return conn;
     } finally {
@@ -918,7 +953,13 @@ export class TTS extends tts.TTS {
     return stream;
   }
 
+  /** @internal Called once when a logical stream finishes, including cancellation. */
+  releaseStream(stream: tts.SynthesizeStream): void {
+    this.#streams.delete(stream);
+  }
+
   async close(): Promise<void> {
+    this.#closed = true;
     for (const stream of this.#streams) {
       stream.close();
     }
@@ -1043,6 +1084,10 @@ export class HTTPSynthesizeStream extends tts.SynthesizeStream {
     super(tts, connOptions);
     this.#tts = tts;
     this.#opts = opts;
+  }
+
+  protected onStreamDone(): void {
+    this.#tts.releaseStream(this);
   }
 
   protected async run(): Promise<void> {
@@ -1193,6 +1238,17 @@ export class SynthesizeStream extends tts.SynthesizeStream {
   #stallReject?: (reason: Error) => void;
   #inputBuffer: Array<string | typeof SynthesizeStream.FLUSH_SENTINEL> = [];
   #attempt = 0;
+  #inputPump?: Promise<void>;
+  #inputEnded = false;
+  #inputStopped = false;
+  #inputError?: Error;
+  #inputWake?: () => void;
+  #connection?: Connection;
+  #emittedAudio = false;
+  #pendingFlushes = 0;
+  #waitingForInput = false;
+  #receivedAudio = false;
+  #awaitingAudio = false;
 
   label = 'elevenlabs.SynthesizeStream';
 
@@ -1213,6 +1269,8 @@ export class SynthesizeStream extends tts.SynthesizeStream {
     if (this.closed || this.abortController.signal.aborted) {
       return;
     }
+    this.#receivedAudio = true;
+    this.#awaitingAudio = false;
     this.#armStallTimer();
     this.#audioQueue.push(data);
   }
@@ -1227,13 +1285,25 @@ export class SynthesizeStream extends tts.SynthesizeStream {
     this.#clearStallTimer();
   }
 
+  markFlushed(): void {
+    this.#pendingFlushes = Math.max(0, this.#pendingFlushes - 1);
+    if (this.#pendingFlushes === 0 && !this.#inputEnded) {
+      // The provider has completed all requested sentences. Waiting for more LLM
+      // text is not a provider stall; the next sentence starts a new deadline.
+      this.#waitingForInput = true;
+      this.#clearStallTimer();
+    }
+  }
+
   /**
    * ElevenLabs signals the end of a context with `isFinal`, and that message is the only
    * thing that settles the synthesis attempt. When it never arrives the attempt would wait
    * forever, so every inbound message restarts a timer bounded by `connOptions.timeoutMs`.
    */
-  #armStallTimer(): void {
-    if (this.#stalled || this.#streamDone || !this.#stallReject) {
+  #armStallTimer(reset = true): void {
+    // Sending more text is not evidence that the provider is responding.
+    if (!reset && this.#stallTimer) return;
+    if (this.#stalled || this.#streamDone || this.#waitingForInput || !this.#stallReject) {
       return;
     }
 
@@ -1253,9 +1323,25 @@ export class SynthesizeStream extends tts.SynthesizeStream {
       return;
     }
 
+    if (!this.#inputEnded && this.#receivedAudio && !this.#awaitingAudio) {
+      // auto_mode does not always send flush_done after a sentence. Audio has
+      // arrived since the most recent text, and the LLM may simply be pausing.
+      // Resume the provider deadline on new text or end-of-input. The outer
+      // audio guard still bounds an indefinitely open, silent input stream.
+      this.#waitingForInput = true;
+      return;
+    }
+
     this.#stalled = true;
     this.#logger.warn(
-      { context_id: this.#contextId, timeout_ms: timeoutMs },
+      {
+        session_id: this.#opts.sessionId,
+        context_id: this.#contextId,
+        attempt: this.#attempt,
+        timeout_ms: timeoutMs,
+        received_audio: this.#receivedAudio,
+        emitted_audio: this.#emittedAudio,
+      },
       'elevenlabs tts stalled, no data received before the timeout; failing the attempt',
     );
     // The stream keeps a replay buffer, so a fresh connection can retry the same
@@ -1266,6 +1352,39 @@ export class SynthesizeStream extends tts.SynthesizeStream {
         options: { retryable: true },
       }),
     );
+  }
+
+  #wakeInput(): void {
+    const wake = this.#inputWake;
+    this.#inputWake = undefined;
+    wake?.();
+  }
+
+  #startInputPump(): void {
+    this.#inputPump ??= (async () => {
+      try {
+        for await (const data of this.input) {
+          if (this.#inputStopped || this.abortSignal.aborted) break;
+          this.#inputBuffer.push(data);
+          this.#wakeInput();
+        }
+      } catch (error) {
+        this.#inputError = asError(error);
+      } finally {
+        this.#inputEnded = true;
+        this.#wakeInput();
+      }
+    })();
+  }
+
+  protected onStreamDone(): void {
+    this.#inputStopped = true;
+    if (!this.input.closed) this.input.close();
+    this.#wakeInput();
+    this.#inputBuffer.length = 0;
+    this.#clearStallTimer();
+    this.#connection?.unregisterStream(this.#contextId);
+    this.#tts.releaseStream(this);
   }
 
   protected async run(): Promise<void> {
@@ -1280,6 +1399,10 @@ export class SynthesizeStream extends tts.SynthesizeStream {
     this.#audioQueue.length = 0;
     this.#timedTranscriptQueue.length = 0;
     this.#stalled = false;
+    this.#pendingFlushes = 0;
+    this.#waitingForInput = false;
+    this.#receivedAudio = false;
+    this.#awaitingAudio = false;
     if (!this.closed) {
       this.#streamDone = false;
     }
@@ -1290,10 +1413,15 @@ export class SynthesizeStream extends tts.SynthesizeStream {
 
     let connection: Connection;
     try {
-      connection = await this.#tts.currentConnection();
+      connection = await this.#tts.currentConnection(this.connOptions.timeoutMs);
     } catch (e) {
       throw new APIConnectionError({ message: 'could not connect to ElevenLabs' });
     }
+
+    if (this.abortSignal.aborted) return;
+    this.#connection = connection;
+    this.#startInputPump();
+    let attemptFinished = false;
 
     let waiterReject: ((reason: Error) => void) | undefined;
     const waiterPromise = new Promise<void>((resolve, reject) => {
@@ -1331,29 +1459,28 @@ export class SynthesizeStream extends tts.SynthesizeStream {
     this.abortController.signal.addEventListener('abort', abortHandler, { once: true });
 
     const inputTask = async () => {
-      if (isRetry) {
-        for (const data of this.#inputBuffer) {
-          if (this.abortController.signal.aborted) break;
+      // One pump owns the upstream iterator across attempts. A failed attempt can
+      // stop immediately; its replacement replays buffered text and keeps consuming
+      // new text without waiting for the LLM to finish or losing its suffix.
+      let cursor = 0;
+      while (!attemptFinished && !this.abortSignal.aborted) {
+        while (cursor < this.#inputBuffer.length) {
+          const data = this.#inputBuffer[cursor++]!;
           if (data === SynthesizeStream.FLUSH_SENTINEL) {
             this.#sentTokenizerStream.flush();
           } else {
             this.#sentTokenizerStream.pushText(data);
           }
         }
-        this.#sentTokenizerStream.endInput();
-        return;
-      }
-
-      for await (const data of this.input) {
-        if (this.abortController.signal.aborted) break;
-        this.#inputBuffer.push(data);
-        if (data === SynthesizeStream.FLUSH_SENTINEL) {
-          this.#sentTokenizerStream.flush();
-          continue;
+        if (this.#inputError) throw this.#inputError;
+        if (this.#inputEnded) {
+          this.#sentTokenizerStream.endInput();
+          return;
         }
-        this.#sentTokenizerStream.pushText(data);
+        await new Promise<void>((resolve) => {
+          this.#inputWake = resolve;
+        });
       }
-      this.#sentTokenizerStream.endInput();
     };
 
     const sentenceStreamTask = async () => {
@@ -1386,12 +1513,16 @@ export class SynthesizeStream extends tts.SynthesizeStream {
 
         const formattedText = `${text} `; // must always end with a space
         this.markStarted();
+        this.#waitingForInput = false;
+        const needsNewDeadline = !this.#awaitingAudio;
+        this.#awaitingAudio = true;
+        if (flushOnChunk) this.#pendingFlushes++;
         connection.sendContent({
           contextId: this.#contextId,
           text: formattedText,
           flush: flushOnChunk,
         });
-        this.#armStallTimer();
+        this.#armStallTimer(needsNewDeadline);
       }
 
       if (xmlContent.length > 0) {
@@ -1399,18 +1530,21 @@ export class SynthesizeStream extends tts.SynthesizeStream {
       }
 
       // Send final empty text to signal end of input
+      if (attemptFinished || this.abortSignal.aborted) return;
+      this.#waitingForInput = false;
+      this.#pendingFlushes++;
       connection.sendContent({ contextId: this.#contextId, text: '', flush: true });
       this.#armStallTimer();
       closeContext();
     };
 
-    let attemptFinished = false;
     const audioProcessTask = async () => {
       let lastFrame: AudioFrame | undefined;
       let pendingTimedTranscripts: TimedString[] = [];
 
       const sendLastFrame = (final: boolean) => {
         if (lastFrame) {
+          this.#emittedAudio = true;
           // Include timedTranscripts with the audio frame
           this.queue.put({
             requestId,
@@ -1477,6 +1611,8 @@ export class SynthesizeStream extends tts.SynthesizeStream {
       await Promise.all([inputPromise, sentenceStreamPromise, audioProcessPromise, waiterPromise]);
     } catch (e) {
       attemptFinished = true;
+      this.#wakeInput();
+      this.#sentTokenizerStream.close();
       await Promise.allSettled([inputPromise, sentenceStreamPromise, audioProcessPromise]);
 
       // If aborted, this is a normal termination - don't throw
@@ -1486,8 +1622,21 @@ export class SynthesizeStream extends tts.SynthesizeStream {
 
       // A silent socket is dead for every context on it, not just this one. Retiring it
       // sends the retry to a fresh websocket instead of the one that stopped answering.
-      if (this.#stalled) {
-        connection.markNonCurrent();
+      connection.markNonCurrent();
+      // A retired connection must not keep its socket and other waiters alive.
+      void connection.close('stall_retirement').catch((error) => {
+        this.#logger.debug({ error }, 'failed to close retired ElevenLabs connection');
+      });
+      if (this.#emittedAudio) {
+        // Re-synthesizing the whole input would audibly repeat the spoken prefix.
+        // Preserve this turn's delivered audio and let the next turn use a fresh
+        // socket. Surface a recoverable error instead of terminating the session.
+        this.#logger.warn(
+          { context_id: this.#contextId, error: asError(e) },
+          'ElevenLabs failed after audio was emitted; retiring connection without replay',
+        );
+        this.#tts.reportRecoverableError(asError(e));
+        return;
       }
 
       // Preserve the original APIError: the caller needs its message and its `retryable`
@@ -1502,18 +1651,29 @@ export class SynthesizeStream extends tts.SynthesizeStream {
       this.#clearStallTimer();
       this.#stallReject = undefined;
       closeContext(true);
+      connection.unregisterStream(this.#contextId);
       // Clean up abort listener
       this.abortController.signal.removeEventListener('abort', abortHandler);
     }
   }
 
-  close(): void {
+  close(reason?: unknown): void {
+    // The outer LiveKit guard can win the timer race. A provider timeout must
+    // retire this socket even then; ordinary user interruptions keep it reusable.
+    if (reason instanceof Error && reason.name === 'IdleTimeoutError') {
+      this.#connection?.markNonCurrent();
+      void this.#connection?.close('outer_timeout').catch((error) => {
+        this.#logger.debug({ error }, 'failed to close timed-out ElevenLabs connection');
+      });
+    }
+    this.#inputStopped = true;
+    this.#wakeInput();
     // Clear audio buffers to prevent memory leak
     this.#audioQueue.length = 0;
     this.#timedTranscriptQueue.length = 0;
     this.#streamDone = true;
     this.#clearStallTimer();
     this.#sentTokenizerStream.close();
-    super.close();
+    super.close(reason);
   }
 }
