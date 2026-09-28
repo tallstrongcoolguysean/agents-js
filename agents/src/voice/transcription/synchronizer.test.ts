@@ -462,6 +462,7 @@ describe('TranscriptionSynchronizer cancellation before the first audio frame', 
   it.each([
     { priorReply: false, cancelledSegments: 1 },
     { priorReply: true, cancelledSegments: 1 },
+    { priorReply: true, cancelledSegments: 3 },
   ])(
     'keeps later transcripts with their own replies: %j',
     async ({ priorReply, cancelledSegments }) => {
