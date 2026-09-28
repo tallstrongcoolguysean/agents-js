@@ -457,3 +457,100 @@ describe('TranscriptionSynchronizer playback-counter drift on a dropped frame', 
     await synchronizer.close();
   });
 });
+
+describe('TranscriptionSynchronizer cancellation before the first audio frame', () => {
+  it.each([
+    { priorReply: false, cancelledSegments: 1 },
+    { priorReply: true, cancelledSegments: 1 },
+  ])(
+    'keeps later transcripts with their own replies: %j',
+    async ({ priorReply, cancelledSegments }) => {
+      vi.useFakeTimers();
+      class PlayingOutput extends AudioOutput {
+        constructor() {
+          super(8000);
+        }
+        async captureFrame(frame: AudioFrame): Promise<void> {
+          await super.captureFrame(frame);
+          this.onPlaybackStarted(Date.now());
+        }
+        clearBuffer(): void {}
+      }
+      const downstream = new PlayingOutput();
+      const synchronizer = new TranscriptionSynchronizer(downstream, new MockTextOutput());
+      const frame = new AudioFrame(new Int16Array(160), 8000, 1, 160);
+      const reply = async (text: string, interrupted: boolean) => {
+        await synchronizer.textOutput.captureText(text);
+        await synchronizer.audioOutput.captureFrame(frame);
+        await synchronizer.textOutput.flush();
+        synchronizer.audioOutput.flush();
+        await vi.advanceTimersByTimeAsync(10_000);
+        downstream.onPlaybackFinished({ playbackPosition: 0.02, interrupted });
+        const event = await synchronizer.audioOutput.waitForPlayout();
+        await synchronizer.barrier();
+        return event.synchronizedTranscript;
+      };
+      try {
+        if (priorReply) {
+          expect(await reply('First complete reply.', false)).toBe('First complete reply.');
+        }
+        for (let i = 0; i < cancelledSegments; i++) {
+          // TTS was cancelled after text arrived, before any audio frame was captured.
+          await synchronizer.textOutput.captureText('Cancelled before audio.');
+          await synchronizer.textOutput.flush();
+          synchronizer.audioOutput.flush();
+          synchronizer.audioOutput.clearBuffer();
+          await synchronizer.audioOutput.waitForPlayout();
+        }
+        expect(await reply('Explanation the student already heard.', false)).toBe(
+          'Explanation the student already heard.',
+        );
+        // Interrupted replies use synchronizedTranscript when committing conversation history.
+        expect(await reply('New feedback after the student answered.', true)).toBe(
+          'New feedback after the student answered.',
+        );
+        expect(await reply('Another independent reply.', true)).toBe('Another independent reply.');
+      } finally {
+        await synchronizer.close();
+        vi.useRealTimers();
+      }
+    },
+  );
+});
+
+it('does not assign an older pending finish to a text-only cancelled segment', async () => {
+  class PendingOutput extends AudioOutput {
+    constructor() {
+      super(8000);
+    }
+    clearBuffer(): void {}
+  }
+  const downstream = new PendingOutput();
+  const synchronizer = new TranscriptionSynchronizer(downstream, new MockTextOutput());
+  const frame = new AudioFrame(new Int16Array(160), 8000, 1, 160);
+  try {
+    await synchronizer.textOutput.captureText('Older reply still finishing.');
+    await synchronizer.audioOutput.captureFrame(frame);
+    await synchronizer.textOutput.flush();
+    synchronizer.audioOutput.flush();
+
+    await synchronizer.textOutput.captureText('Cancelled before audio.');
+    await synchronizer.textOutput.flush();
+    synchronizer.audioOutput.flush();
+
+    await synchronizer.textOutput.captureText('Current reply.');
+    await synchronizer.audioOutput.captureFrame(frame);
+    await synchronizer.textOutput.flush();
+    synchronizer.audioOutput.flush();
+
+    // Only the older audio segment owes a finish; the cancelled text must not queue one.
+    expect(synchronizer._pendingRotatedSegments).toHaveLength(1);
+    downstream.onPlaybackFinished({ playbackPosition: 0.02, interrupted: true });
+    downstream.onPlaybackFinished({ playbackPosition: 0.02, interrupted: false });
+    const event = await synchronizer.audioOutput.waitForPlayout();
+    expect(event.synchronizedTranscript).toBe('Current reply.');
+    expect(synchronizer._pendingRotatedSegments).toHaveLength(0);
+  } finally {
+    await synchronizer.close();
+  }
+});

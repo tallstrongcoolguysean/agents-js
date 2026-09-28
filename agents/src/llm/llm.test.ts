@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 import { beforeAll, describe, expect, it, vi } from 'vitest';
+import { APIConnectionError } from '../_exceptions.js';
 import { initializeLogger } from '../log.js';
 import { type APIConnectOptions, DEFAULT_API_CONNECT_OPTIONS } from '../types.js';
 import { Future, Task, delay } from '../utils.js';
@@ -249,5 +250,34 @@ describe('LLMStream.collect', () => {
     expect(response.toolCalls).toHaveLength(0);
     expect(response.usage).toBeUndefined();
     expect(response.extra).toEqual({});
+  });
+});
+
+
+describe('LLM terminal failure lifecycle', () => {
+  it.each([false, true])('reports a fatal failure without leaking a rejection (partial=%s)', async (partial) => {
+    let attempts = 0;
+    class FailingStream extends LLMStream {
+      protected async run(): Promise<void> {
+        attempts++;
+        if (partial) this.queue.put({ id: 'partial', delta: { role: 'assistant', content: 'Partial.' } });
+        throw new APIConnectionError({ message: 'injected failure', options: { retryable: !partial } });
+      }
+    }
+    const model = new MockLLM([]);
+    const errors: boolean[] = [];
+    model.on('error', (event) => errors.push(event.recoverable));
+    const stream = new FailingStream(model, {
+      chatCtx: new ChatContext(),
+      connOptions: { ...DEFAULT_API_CONNECT_OPTIONS, maxRetry: 1, retryIntervalMs: 0 },
+    });
+    const chunks: ChatChunk[] = [];
+    for await (const chunk of stream) chunks.push(chunk);
+    await waitForTasks();
+    expect(attempts).toBe(partial ? 1 : 2);
+    expect(errors).toEqual(partial ? [false] : [true, false]);
+    expect(chunks).toHaveLength(partial ? 1 : 0);
+    stream.close();
+    await model.aclose();
   });
 });

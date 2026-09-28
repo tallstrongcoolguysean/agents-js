@@ -987,13 +987,20 @@ class SyncedTextOutput extends TextOutput {
       this.logger.warn(
         'SegmentSynchronizerImpl text marked as ended in capture text, rotating segment',
       );
-      // This segment's text input already ended but its on_playback_finished hasn't arrived
-      // yet (interrupt + fast next reply). Remember it so the still-pending playback_finished
-      // settles *this* segment, not the new one we're about to rotate in.
-      this.synchronizer._pendingRotatedSegments.push({
-        impl: this.synchronizer._impl,
-        acceptedDownstream: this.synchronizer.audioOutput._rotationCandidateAccepted,
-      });
+      // Only retain a segment that actually owes a playback finish. A reply cancelled
+      // before its first audio frame has text, but no captured audio segment. Queuing it
+      // would inherit the previous reply's acceptance flag and steal a later reply's finish,
+      // leaving interrupted conversation history one transcript behind. Already-rotated
+      // segments account for their own pending finishes, not this segment's.
+      if (
+        this.synchronizer.audioOutput.pendingPlayoutSegments >
+        this.synchronizer._pendingRotatedSegments.length
+      ) {
+        this.synchronizer._pendingRotatedSegments.push({
+          impl: this.synchronizer._impl,
+          acceptedDownstream: this.synchronizer.audioOutput._rotationCandidateAccepted,
+        });
+      }
       this.synchronizer.rotateSegment();
       await this.synchronizer.barrier();
     }
