@@ -531,6 +531,32 @@ describe('RecorderIO close', () => {
     expect(fs.existsSync(outputPath)).toBe(true);
     expect(fs.statSync(outputPath).size).toBeGreaterThan(0);
   }, 15000);
+
+  it('bounds buffered input when an agent segment never receives its playback finish', async () => {
+    const { recorder, input, inWrapped, outWrapped, outputPath } = makeRecorder();
+    const tunable = recorder as unknown as { writeIntervalMs: number; maxInputHoldMs: number };
+    tunable.writeIntervalMs = 20;
+    tunable.maxInputHoldMs = 100;
+    await recorder.start(outputPath);
+
+    await outWrapped.captureFrame(makeFrame(100));
+    outWrapped.flush();
+    expect(outWrapped.hasPendingData).toBe(true);
+
+    const accFrames = () => (inWrapped as unknown as { accFrames: AudioFrame[] }).accFrames;
+    const reader = inWrapped.stream.getReader();
+    for (let i = 0; i < 20; i++) {
+      await input.push(makeFrame(10));
+      await reader.read();
+      await new Promise((resolve) => setTimeout(resolve, 15));
+    }
+    reader.releaseLock();
+
+    expect(outWrapped.hasPendingData).toBe(true);
+    expect(accFrames().length).toBeLessThan(20);
+
+    await recorder.close();
+  }, 15000);
 });
 
 describe('RecorderAudioOutput', () => {

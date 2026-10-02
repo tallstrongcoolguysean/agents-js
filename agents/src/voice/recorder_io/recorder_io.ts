@@ -30,6 +30,9 @@ configureFfmpeg();
 const WRITE_INTERVAL_MS = 2500;
 const DEFAULT_SAMPLE_RATE = 48000;
 const CLOSE_PLAYOUT_FLUSH_TIMEOUT_MS = 2000;
+// Upper bound on holding input while agent playout is pending. A segment whose finish is
+// lost keeps `hasPendingData` true indefinitely, and every mic frame would accumulate.
+const MAX_INPUT_HOLD_MS = 60_000;
 
 export interface RecorderOptions {
   agentSession: AgentSession;
@@ -61,6 +64,8 @@ export class RecorderIO {
   private started: boolean = false;
   private closing: boolean = false;
   private closePlayoutFlushTimeoutMs: number = CLOSE_PLAYOUT_FLUSH_TIMEOUT_MS;
+  private writeIntervalMs: number = WRITE_INTERVAL_MS;
+  private maxInputHoldMs: number = MAX_INPUT_HOLD_MS;
 
   // FFmpeg streaming state
   private pcmStream?: PassThrough;
@@ -231,9 +236,12 @@ export class RecorderIO {
    * Forward task: periodically flush input buffer to encoder
    */
   private async forward(signal: AbortSignal): Promise<void> {
+    let pendingSince: number | undefined;
+    let warnedStuckPlayout = false;
+
     while (!signal.aborted && this.started && !this.closing) {
       try {
-        await delay(WRITE_INTERVAL_MS, { signal });
+        await delay(this.writeIntervalMs, { signal });
       } catch {
         // Aborted
         break;
@@ -241,7 +249,20 @@ export class RecorderIO {
 
       if (this.outRecord!.hasPendingData) {
         // If the output is currently playing audio, wait for it to stay in sync
-        continue;
+        pendingSince ??= Date.now();
+        if (Date.now() - pendingSince < this.maxInputHoldMs) {
+          continue;
+        }
+        if (!warnedStuckPlayout) {
+          warnedStuckPlayout = true;
+          this.logger.warn(
+            { heldMs: Date.now() - pendingSince },
+            'agent playout has been pending too long; flushing recorder input to bound memory',
+          );
+        }
+      } else {
+        pendingSince = undefined;
+        warnedStuckPlayout = false;
       }
 
       // Flush input buffer
