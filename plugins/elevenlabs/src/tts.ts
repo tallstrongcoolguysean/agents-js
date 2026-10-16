@@ -93,6 +93,15 @@ export interface TTSOptions {
    * is emitted as recoverable and later sentences can still synthesize.
    */
   continueOnError?: boolean;
+  /**
+   * Where a WebSocket stream finishes an utterance that the provider abandons after its
+   * audio started playing. The rest is synthesized over HTTP from the first word without
+   * audio, so the listener hears neither a repeat nor a gap in the text. Left unset, it uses
+   * this instance's `apiKey` and `baseURL`. An `apiKey` of its own without a `baseURL` goes to
+   * the ElevenLabs API, since a separate key usually means `baseURL` is a WebSocket-only
+   * proxy. `false` ends the utterance at the failure.
+   */
+  tailFallback?: { apiKey?: string; baseURL?: string } | false;
   pronunciationDictionaryLocators?: PronunciationDictionaryLocator[];
 }
 
@@ -120,6 +129,7 @@ interface ResolvedTTSOptions {
   autoMode: boolean;
   streamingTransport: 'websocket' | 'http';
   continueOnError: boolean;
+  tailFallback: { apiKey: string; baseURL: string } | false;
   pronunciationDictionaryLocators?: PronunciationDictionaryLocator[];
 }
 
@@ -268,6 +278,111 @@ function toTimedWords(
   }
 
   return [timedWords, text.slice(end)];
+}
+
+const WORD_CHAR = /[\p{L}\p{N}'’]/u;
+// Characters after a cut that carry no audio of their own.
+const SILENT_CHAR = /[\s.,!?;:)\]}"'”’»…]/u;
+
+function countNonSpace(text: string): number {
+  return text.replace(/\s/g, '').length;
+}
+
+/** Index just past the `count`-th non-whitespace character of `text`. */
+function nonSpaceOffset(text: string, count: number): number {
+  let index = 0;
+  for (let seen = 0; index < text.length && seen < count; index++) {
+    if (!/\s/.test(text[index]!)) seen++;
+  }
+  return index;
+}
+
+/**
+ * Where to resume `text` once its first `spokenChars` non-whitespace characters have audio.
+ * Alignment is counted without whitespace because the sentence tokenizer re-spaces the text
+ * it sends. A cut inside a word resumes at the start of that word.
+ */
+function resumeOffset(
+  text: string,
+  spokenChars: number,
+): { spokenEnd: number; offset: number; midWord: boolean } {
+  const spokenEnd = nonSpaceOffset(text, spokenChars);
+  let offset = spokenEnd;
+  if (
+    offset > 0 &&
+    offset < text.length &&
+    WORD_CHAR.test(text[offset - 1]!) &&
+    WORD_CHAR.test(text[offset]!)
+  ) {
+    while (offset > 0 && WORD_CHAR.test(text[offset - 1]!)) offset--;
+    return { spokenEnd, offset, midWord: true };
+  }
+  while (offset < text.length && SILENT_CHAR.test(text[offset]!)) offset++;
+  return { spokenEnd, offset, midWord: false };
+}
+
+/** Synthesizes `text` with one HTTP request and yields its audio as frames. */
+async function* streamHttpSpeech(
+  opts: ResolvedTTSOptions,
+  text: string,
+  signal: AbortSignal,
+  previousText?: string,
+): AsyncGenerator<AudioFrame> {
+  const voiceSettings = opts.voiceSettings ? stripUndefined(opts.voiceSettings) : undefined;
+  const extraParams: Record<string, string | boolean> = {};
+  if (opts.language) {
+    extraParams.language_code = getBaseLanguage(opts.language);
+  }
+  if (opts.applyLanguageTextNormalization !== undefined) {
+    extraParams.apply_language_text_normalization = opts.applyLanguageTextNormalization;
+  }
+  if (previousText) {
+    // Lets the voice continue the earlier text's intonation instead of starting afresh.
+    extraParams.previous_text = previousText;
+  }
+
+  const url = synthesizeUrl(opts);
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      [AUTHORIZATION_HEADER]: opts.apiKey,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      text,
+      model_id: opts.model,
+      voice_settings: voiceSettings,
+      apply_text_normalization: opts.applyTextNormalization,
+      ...extraParams,
+    }),
+    signal,
+  });
+  if (!response.ok) {
+    throw new APIStatusError({
+      message: `ElevenLabs API error from ${url}: ${await response.text()}`,
+      options: { statusCode: response.status },
+    });
+  }
+
+  const contentType = response.headers.get('content-type') || '';
+  if (!contentType.startsWith('audio/')) {
+    throw new APIError(`ElevenLabs returned non-audio data: ${await response.text()}`);
+  }
+
+  const reader = response.body?.getReader();
+  if (!reader) {
+    throw new APIError('No response body');
+  }
+
+  const audioBytes = new AudioByteStream(opts.sampleRate, 1);
+  while (!signal.aborted) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    yield* audioBytes.write(value);
+  }
+  yield* audioBytes.flush();
 }
 
 class Connection {
@@ -603,6 +718,11 @@ class Connection {
             starts.length === durs.length
           ) {
             ctx.textBuffer += chars.join('');
+            // The original alignment indexes the text that was sent, which a stream needs to
+            // resume an utterance; the normalized one can spell out numbers and abbreviations.
+            const originalChars = (data.alignment as { chars?: string[] } | null | undefined)
+              ?.chars;
+            stream.noteAlignment(chars.join(''), originalChars?.join(''));
 
             // Handle chars with multiple characters
             for (let i = 0; i < chars.length; i++) {
@@ -813,6 +933,7 @@ export class TTS extends tts.TTS {
     const model = opts.model ?? opts.modelID ?? 'eleven_turbo_v2_5';
     const rawLanguage = opts.language ?? opts.languageCode;
     const language = rawLanguage ? normalizeLanguage(rawLanguage) : undefined;
+    const baseURL = opts.baseURL ?? API_BASE_URL_V1;
 
     this.#opts = {
       apiKey,
@@ -821,7 +942,7 @@ export class TTS extends tts.TTS {
       voiceSettings,
       model,
       language,
-      baseURL: opts.baseURL ?? API_BASE_URL_V1,
+      baseURL,
       encoding,
       sampleRate,
       streamingLatency: opts.streamingLatency,
@@ -837,6 +958,15 @@ export class TTS extends tts.TTS {
       autoMode,
       streamingTransport,
       continueOnError: opts.continueOnError ?? false,
+      tailFallback:
+        opts.tailFallback === false
+          ? false
+          : {
+              apiKey: opts.tailFallback?.apiKey ?? apiKey,
+              baseURL:
+                opts.tailFallback?.baseURL ??
+                (opts.tailFallback?.apiKey ? API_BASE_URL_V1 : baseURL),
+            },
       pronunciationDictionaryLocators: opts.pronunciationDictionaryLocators,
     };
   }
@@ -1136,73 +1266,10 @@ export class HTTPSynthesizeStream extends tts.SynthesizeStream {
   }
 
   async #synthesizeSentence(text: string): Promise<void> {
-    const voiceSettings = this.#opts.voiceSettings
-      ? stripUndefined(this.#opts.voiceSettings)
-      : undefined;
-    const extraParams: Record<string, string | boolean> = {};
-    if (this.#opts.language) {
-      extraParams.language_code = getBaseLanguage(this.#opts.language);
-    }
-    if (this.#opts.applyLanguageTextNormalization !== undefined) {
-      extraParams.apply_language_text_normalization = this.#opts.applyLanguageTextNormalization;
-    }
-
-    const url = synthesizeUrl(this.#opts);
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        [AUTHORIZATION_HEADER]: this.#opts.apiKey,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        text,
-        model_id: this.#opts.model,
-        voice_settings: voiceSettings,
-        apply_text_normalization: this.#opts.applyTextNormalization,
-        ...extraParams,
-      }),
-      signal: this.abortSignal,
-    });
-    if (!response.ok) {
-      throw new APIStatusError({
-        message: `ElevenLabs API error from ${url}: ${await response.text()}`,
-        options: { statusCode: response.status },
-      });
-    }
-
-    const contentType = response.headers.get('content-type') || '';
-    if (!contentType.startsWith('audio/')) {
-      throw new APIError(`ElevenLabs returned non-audio data: ${await response.text()}`);
-    }
-
-    const reader = response.body?.getReader();
-    if (!reader) {
-      throw new APIError('No response body');
-    }
-
     const requestId = shortuuid();
-    const audioBytes = new AudioByteStream(this.#opts.sampleRate, 1);
     let lastFrame: AudioFrame | undefined;
 
-    while (!this.abortController.signal.aborted) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
-      }
-      for (const frame of audioBytes.write(value)) {
-        if (lastFrame) {
-          this.queue.put({
-            requestId,
-            segmentId: requestId,
-            frame: lastFrame,
-            final: false,
-          });
-        }
-        lastFrame = frame;
-      }
-    }
-
-    for (const frame of audioBytes.flush()) {
+    for await (const frame of streamHttpSpeech(this.#opts, text, this.abortSignal)) {
       if (lastFrame) {
         this.queue.put({
           requestId,
@@ -1249,6 +1316,10 @@ export class SynthesizeStream extends tts.SynthesizeStream {
   #waitingForInput = false;
   #receivedAudio = false;
   #awaitingAudio = false;
+  // How far the provider got, so an abandoned utterance can resume after it.
+  #alignedText = '';
+  #transcribedChars = 0;
+  #spokenChars = 0;
 
   label = 'elevenlabs.SynthesizeStream';
 
@@ -1277,7 +1348,19 @@ export class SynthesizeStream extends tts.SynthesizeStream {
 
   pushTimedTranscript(timedWords: TimedString[]): void {
     this.#armStallTimer();
+    for (const word of timedWords) {
+      this.#transcribedChars += countNonSpace(word.text);
+    }
     this.#timedTranscriptQueue.push(...timedWords);
+  }
+
+  /**
+   * Records the characters that arrived with audio: `text` in the preferred alignment, which
+   * the timed words are cut from, and `originalText` as it was sent, when the provider has it.
+   */
+  noteAlignment(text: string, originalText?: string): void {
+    this.#alignedText += text;
+    this.#spokenChars += countNonSpace(originalText ?? text);
   }
 
   markDone(): void {
@@ -1341,6 +1424,11 @@ export class SynthesizeStream extends tts.SynthesizeStream {
         timeout_ms: timeoutMs,
         received_audio: this.#receivedAudio,
         emitted_audio: this.#emittedAudio,
+        // Which side went quiet: the provider owing audio for sent text, or the provider
+        // not finishing after the input ended.
+        awaiting_audio: this.#awaitingAudio,
+        input_ended: this.#inputEnded,
+        pending_flushes: this.#pendingFlushes,
       },
       'elevenlabs tts stalled, no data received before the timeout; failing the attempt',
     );
@@ -1403,6 +1491,9 @@ export class SynthesizeStream extends tts.SynthesizeStream {
     this.#waitingForInput = false;
     this.#receivedAudio = false;
     this.#awaitingAudio = false;
+    this.#alignedText = '';
+    this.#transcribedChars = 0;
+    this.#spokenChars = 0;
     if (!this.closed) {
       this.#streamDone = false;
     }
@@ -1538,27 +1629,28 @@ export class SynthesizeStream extends tts.SynthesizeStream {
       closeContext();
     };
 
+    // Kept outside the audio task so an abandoned utterance can play out what it received.
+    let lastFrame: AudioFrame | undefined;
+    let pendingTimedTranscripts: TimedString[] = [];
+
+    const sendLastFrame = (final: boolean) => {
+      if (lastFrame) {
+        this.#emittedAudio = true;
+        // Include timedTranscripts with the audio frame
+        this.queue.put({
+          requestId,
+          segmentId,
+          frame: lastFrame,
+          final,
+          timedTranscripts:
+            pendingTimedTranscripts.length > 0 ? pendingTimedTranscripts : undefined,
+        });
+        lastFrame = undefined;
+        pendingTimedTranscripts = [];
+      }
+    };
+
     const audioProcessTask = async () => {
-      let lastFrame: AudioFrame | undefined;
-      let pendingTimedTranscripts: TimedString[] = [];
-
-      const sendLastFrame = (final: boolean) => {
-        if (lastFrame) {
-          this.#emittedAudio = true;
-          // Include timedTranscripts with the audio frame
-          this.queue.put({
-            requestId,
-            segmentId,
-            frame: lastFrame,
-            final,
-            timedTranscripts:
-              pendingTimedTranscripts.length > 0 ? pendingTimedTranscripts : undefined,
-          });
-          lastFrame = undefined;
-          pendingTimedTranscripts = [];
-        }
-      };
-
       while (!this.abortController.signal.aborted && !this.#stalled && !attemptFinished) {
         // Drain timed transcript queue
         while (this.#timedTranscriptQueue.length > 0) {
@@ -1603,6 +1695,109 @@ export class SynthesizeStream extends tts.SynthesizeStream {
       sendLastFrame(true);
     };
 
+    // The provider abandoned an utterance that is already playing. Play out what it did send,
+    // then synthesize the rest over HTTP from the first word without audio: replaying the
+    // whole input would repeat what the listener already heard.
+    const finishOverHttp = async (tail: { apiKey: string; baseURL: string }) => {
+      let cursor = this.#inputBuffer.length;
+      const inputText = this.#inputBuffer
+        .filter((data): data is string => typeof data === 'string')
+        .join('');
+      const { spokenEnd, offset, midWord } = resumeOffset(inputText, this.#spokenChars);
+
+      while (this.#timedTranscriptQueue.length > 0) {
+        pendingTimedTranscripts.push(this.#timedTranscriptQueue.shift()!);
+      }
+      // The aligner holds back its last word in case the next chunk continues it. A word cut
+      // in half is spoken again below; a whole one belongs in the transcript now.
+      if (!midWord) {
+        const heldBack = (
+          this.#alignedText.slice(nonSpaceOffset(this.#alignedText, this.#transcribedChars)) +
+          inputText.slice(spokenEnd, offset)
+        ).trim();
+        if (heldBack) {
+          pendingTimedTranscripts.push(createTimedString({ text: `${heldBack} ` }));
+        }
+      }
+      while (this.#audioQueue.length > 0) {
+        for (const frame of bstream.write(this.#audioQueue.shift()!)) {
+          sendLastFrame(false);
+          lastFrame = frame;
+        }
+      }
+      for (const frame of bstream.flush()) {
+        sendLastFrame(false);
+        lastFrame = frame;
+      }
+
+      const sentences = new tokenize.basic.SentenceTokenizer().stream();
+      const wake = () => this.#wakeInput();
+      this.abortSignal.addEventListener('abort', wake, { once: true });
+
+      // The LLM may still be streaming the utterance; keep taking its text.
+      const feedSentences = async () => {
+        sentences.pushText(inputText.slice(offset));
+        while (!this.abortSignal.aborted && !this.#inputError) {
+          while (cursor < this.#inputBuffer.length) {
+            const data = this.#inputBuffer[cursor++]!;
+            if (data === SynthesizeStream.FLUSH_SENTINEL) {
+              sentences.flush();
+            } else {
+              sentences.pushText(data);
+            }
+          }
+          if (this.#inputEnded) break;
+          await new Promise<void>((resolve) => {
+            this.#inputWake = resolve;
+          });
+        }
+        sentences.endInput();
+      };
+
+      const speakSentences = async () => {
+        const httpOpts = { ...this.#opts, ...tail };
+        let previousText = inputText.slice(0, offset);
+        for await (const { token } of sentences) {
+          if (this.abortSignal.aborted) break;
+          let firstFrame = true;
+          try {
+            for await (const frame of streamHttpSpeech(
+              httpOpts,
+              token,
+              this.abortSignal,
+              previousText.slice(-500),
+            )) {
+              sendLastFrame(false);
+              lastFrame = frame;
+              if (firstFrame) {
+                pendingTimedTranscripts.push(createTimedString({ text: `${token} ` }));
+                firstFrame = false;
+              }
+            }
+          } catch (error) {
+            if (this.abortSignal.aborted) break;
+            // Losing one sentence beats losing the rest of the utterance.
+            this.#logger.warn(
+              { session_id: this.#opts.sessionId, context_id: this.#contextId, error },
+              'ElevenLabs HTTP failed for a sentence of an abandoned utterance',
+            );
+            this.#tts.reportRecoverableError(asError(error));
+          }
+          previousText += `${token} `;
+        }
+      };
+
+      try {
+        await Promise.all([feedSentences(), speakSentences()]);
+      } finally {
+        this.abortSignal.removeEventListener('abort', wake);
+        sentences.close();
+      }
+      if (!this.abortSignal.aborted) {
+        sendLastFrame(true);
+      }
+    };
+
     const inputPromise = inputTask();
     const sentenceStreamPromise = sentenceStreamTask();
     const audioProcessPromise = audioProcessTask();
@@ -1628,9 +1823,26 @@ export class SynthesizeStream extends tts.SynthesizeStream {
         this.#logger.debug({ error }, 'failed to close retired ElevenLabs connection');
       });
       if (this.#emittedAudio) {
-        // Re-synthesizing the whole input would audibly repeat the spoken prefix.
-        // Preserve this turn's delivered audio and let the next turn use a fresh
-        // socket. Surface a recoverable error instead of terminating the session.
+        // Re-synthesizing the whole input would audibly repeat the spoken prefix, so the
+        // utterance continues over HTTP from where the audio stopped and the next turn
+        // uses a fresh socket. Surface a recoverable error instead of ending the session.
+        const tail = this.#opts.tailFallback;
+        if (tail && this.#spokenChars > 0) {
+          this.#logger.warn(
+            {
+              session_id: this.#opts.sessionId,
+              context_id: this.#contextId,
+              spoken_chars: this.#spokenChars,
+              error: asError(e),
+            },
+            'ElevenLabs failed after audio was emitted; finishing the utterance over HTTP',
+          );
+          this.#tts.reportRecoverableError(asError(e));
+          await finishOverHttp(tail);
+          return;
+        }
+
+        // Without alignment there is no telling where the audio stopped.
         this.#logger.warn(
           { context_id: this.#contextId, error: asError(e) },
           'ElevenLabs failed after audio was emitted; retiring connection without replay',
