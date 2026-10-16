@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: 2024 LiveKit, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
+import { tts } from '@livekit/agents';
 import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import { describe, expect, it, vi } from 'vitest';
 import { type WebSocket, WebSocketServer } from 'ws';
-import { TTS, type VoiceSettings } from './tts.js';
+import { TTS, type TTSOptions, type VoiceSettings } from './tts.js';
 
 async function startWebSocketServer() {
   const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 });
@@ -708,6 +709,275 @@ describe('ElevenLabs TTS stall watchdog', () => {
     );
 
     expect(errors).toHaveLength(0);
+    expect(events.length).toBeGreaterThan(0);
+  });
+});
+
+describe('ElevenLabs TTS abandoned utterance', () => {
+  // Two 100 ms frames, so the first one plays before the provider goes quiet.
+  const audio = Buffer.alloc(8820).toString('base64');
+  const connOptions = { maxRetry: 0, retryIntervalMs: 0, timeoutMs: 150 };
+  const utterance = 'The waste backup gets more serious. Then the kidneys struggle to keep up.';
+
+  function alignment(text: string) {
+    const chars = [...text];
+    return {
+      chars,
+      charStartTimesMs: chars.map((_, i) => i * 10),
+      charDurationsMs: chars.map(() => 10),
+    };
+  }
+
+  /**
+   * The provider voices `spoken` for the first sentence it gets, then never answers again.
+   * `spoken: null` sends that audio without alignment. ElevenLabs HTTP answers with audio
+   * unless `respond` says otherwise.
+   */
+  async function abandonAfter(
+    spoken: string | null,
+    drive: (
+      stream: tts.SynthesizeStream,
+      wait: { heard: () => Promise<void>; stalled: () => Promise<void> },
+    ) => Promise<void>,
+    opts: {
+      tailFallback?: TTSOptions['tailFallback'];
+      respond?: (call: number, signal?: AbortSignal | null) => Promise<Response | undefined>;
+      /** Speak through LiveKit's FallbackAdapter, with an HTTP instance behind the socket. */
+      fallbackAdapter?: boolean;
+    } = {},
+  ) {
+    const { wss, baseURL } = await startWebSocketServer();
+    let answered = false;
+    wss.on('connection', (ws) => {
+      ws.on('message', (raw) => {
+        const message = JSON.parse(raw.toString()) as Record<string, unknown>;
+        if (answered || message.text === ' ' || !message.text) return;
+        answered = true;
+        ws.send(
+          JSON.stringify({
+            context_id: message.context_id,
+            audio,
+            ...(spoken === null
+              ? {}
+              : { alignment: alignment(spoken), normalizedAlignment: alignment(spoken) }),
+          }),
+        );
+      });
+    });
+
+    const requests: { url: string; apiKey: string | null; body: Record<string, unknown> }[] = [];
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      requests.push({
+        url: String(input),
+        apiKey: new Headers(init?.headers).get('xi-api-key'),
+        body: JSON.parse(String(init?.body)) as Record<string, unknown>,
+      });
+      return (
+        (await opts.respond?.(requests.length, init?.signal)) ??
+        new Response(Buffer.alloc(8820), { status: 200, headers: { 'Content-Type': 'audio/pcm' } })
+      );
+    });
+
+    const websocket = new TTS({ apiKey: 'test-key', baseURL, tailFallback: opts.tailFallback });
+    const source = opts.fallbackAdapter
+      ? new tts.FallbackAdapter({
+          ttsInstances: [
+            websocket,
+            new TTS({ apiKey: 'test-key', streamingTransport: 'http', continueOnError: true }),
+          ],
+          maxRetryPerTTS: 0,
+        })
+      : websocket;
+    const errors: { error: Error; recoverable: boolean }[] = [];
+    source.on('error', (event: { error: Error; recoverable: boolean }) => errors.push(event));
+    const stream = source.stream({ connOptions });
+    const events: tts.SynthesizedAudio[] = [];
+    const outputTask = (async () => {
+      for await (const event of stream) {
+        if (event !== tts.SynthesizeStream.END_OF_STREAM) events.push(event);
+      }
+    })();
+
+    try {
+      await drive(stream, {
+        heard: () => waitUntil(() => events.length > 0, 2000),
+        stalled: () => waitUntil(() => errors.length > 0, 2000),
+      });
+      await waitFor(outputTask, 5000);
+      const transcript = events
+        .flatMap((event) => event.timedTranscripts ?? [])
+        .map((word) => word.text)
+        .join('')
+        .trim();
+
+      return { requests, events, errors, transcript };
+    } finally {
+      stream.close();
+      await source.close();
+      await closeWebSocketServer(wss);
+      fetchMock.mockRestore();
+    }
+  }
+
+  const speakAll = async (stream: tts.SynthesizeStream) => {
+    stream.pushText(utterance);
+    stream.endInput();
+  };
+  const spokenOverHttp = (requests: { body: Record<string, unknown> }[]) =>
+    requests.map((request) => request.body.text).join(' ');
+
+  it('finishes over HTTP from the first word without audio', async () => {
+    const { requests, events, errors, transcript } = await abandonAfter(
+      'The waste backup gets more ',
+      speakAll,
+      { tailFallback: { apiKey: 'http-key', baseURL: 'https://http.example.test/v1' } },
+    );
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!.recoverable).toBe(true);
+    expect(errors[0]!.error.message).toContain('no data for 150ms');
+    expect(spokenOverHttp(requests)).toBe('serious. Then the kidneys struggle to keep up.');
+    expect(requests[0]!.url.startsWith('https://http.example.test/v1/text-to-speech/')).toBe(true);
+    expect(requests[0]!.apiKey).toBe('http-key');
+    expect(requests[0]!.body.previous_text).toBe('The waste backup gets more ');
+    expect(transcript).toBe(utterance);
+    expect(events.at(-1)!.final).toBe(true);
+    expect(events.slice(0, -1).every((event) => !event.final)).toBe(true);
+  });
+
+  it('sends a tail with its own key to the ElevenLabs API, not the WebSocket proxy', async () => {
+    const { requests } = await abandonAfter('The waste backup gets more ', speakAll, {
+      tailFallback: { apiKey: 'http-key' },
+    });
+
+    expect(requests[0]!.url.startsWith('https://api.elevenlabs.io/v1/text-to-speech/')).toBe(true);
+    expect(requests[0]!.apiKey).toBe('http-key');
+  });
+
+  it('speaks a word cut in half again from its start', async () => {
+    const { requests, transcript } = await abandonAfter('The waste backup gets mo', speakAll);
+
+    expect(spokenOverHttp(requests)).toBe('more serious. Then the kidneys struggle to keep up.');
+    expect(transcript).toBe(utterance);
+  });
+
+  it('keeps taking text the LLM streams after the provider stalls', async () => {
+    const { requests, transcript } = await abandonAfter(
+      'The waste backup gets more ',
+      async (stream, { heard, stalled }) => {
+        stream.pushText('The waste backup gets more serious.');
+        stream.flush();
+        await heard();
+        // The provider never answers this sentence, which is what stalls the attempt.
+        stream.pushText(' Then the kidneys struggle to keep up.');
+        stream.flush();
+        await stalled();
+        stream.pushText(' Fluid starts to build.');
+        stream.endInput();
+      },
+    );
+
+    expect(spokenOverHttp(requests).startsWith('serious.')).toBe(true);
+    expect(spokenOverHttp(requests)).toContain('Fluid starts to build.');
+    expect(spokenOverHttp(requests)).not.toContain('gets more');
+    expect(transcript).toBe(`${utterance} Fluid starts to build.`);
+  });
+
+  it('plays out the received audio when only the final message is missing', async () => {
+    const { requests, events, errors, transcript } = await abandonAfter(utterance, speakAll);
+
+    expect(errors).toHaveLength(1);
+    expect(requests).toHaveLength(0);
+    // Including the last word, which the aligner holds back until the final message.
+    expect(transcript).toBe(utterance);
+    expect(events.at(-1)!.final).toBe(true);
+  });
+
+  it('loses only the sentence whose HTTP request fails', async () => {
+    const { requests, events, errors, transcript } = await abandonAfter(
+      'The waste backup gets more serious. ',
+      async (stream) => {
+        stream.pushText(`${utterance} Fluid starts to build up in the body.`);
+        stream.endInput();
+      },
+      {
+        respond: async (call) =>
+          call === 1 ? new Response('provider unavailable', { status: 503 }) : undefined,
+      },
+    );
+
+    expect(spokenOverHttp(requests)).toBe(
+      'Then the kidneys struggle to keep up. Fluid starts to build up in the body.',
+    );
+    expect(errors.map((event) => event.recoverable)).toEqual([true, true]);
+    expect(transcript).toBe(
+      'The waste backup gets more serious. Fluid starts to build up in the body.',
+    );
+    expect(events.at(-1)!.final).toBe(true);
+  });
+
+  it('stops the HTTP tail when the listener interrupts', async () => {
+    let requestStarted = false;
+    let requestAborted = false;
+    const { requests, events } = await abandonAfter(
+      'The waste backup gets more ',
+      async (stream, { stalled }) => {
+        await speakAll(stream);
+        await stalled();
+        await waitUntil(() => requestStarted);
+        stream.close();
+      },
+      {
+        respond: (_call, signal) =>
+          new Promise<Response>((_resolve, reject) => {
+            requestStarted = true;
+            signal?.addEventListener(
+              'abort',
+              () => {
+                requestAborted = true;
+                reject(new DOMException('interrupted', 'AbortError'));
+              },
+              { once: true },
+            );
+          }),
+      },
+    );
+
+    expect(requests).toHaveLength(1);
+    expect(requestAborted).toBe(true);
+    expect(events.some((event) => event.final)).toBe(false);
+  });
+
+  it('finishes inside the FallbackAdapter instead of switching instances', async () => {
+    const { requests, events, transcript } = await abandonAfter(
+      'The waste backup gets more ',
+      speakAll,
+      { fallbackAdapter: true },
+    );
+
+    // The HTTP instance behind the socket would have re-synthesized the whole utterance.
+    expect(spokenOverHttp(requests)).toBe('serious. Then the kidneys struggle to keep up.');
+    expect(transcript).toBe(utterance);
+    expect(events.at(-1)!.final).toBe(true);
+  });
+
+  it('ends the utterance at the failure when the tail fallback is off', async () => {
+    const { requests, events, errors } = await abandonAfter(
+      'The waste backup gets more ',
+      speakAll,
+      { tailFallback: false },
+    );
+
+    expect(requests).toHaveLength(0);
+    expect(errors).toHaveLength(1);
+    expect(events.length).toBeGreaterThan(0);
+  });
+
+  it('does not guess where to resume without alignment', async () => {
+    const { requests, events, errors } = await abandonAfter(null, speakAll);
+
+    expect(requests).toHaveLength(0);
+    expect(errors).toHaveLength(1);
     expect(events.length).toBeGreaterThan(0);
   });
 });
