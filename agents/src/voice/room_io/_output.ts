@@ -381,6 +381,8 @@ export class ParticipantAudioOutput extends AudioOutput {
   private pushedDuration: number = 0;
   private startedFuture: Future<void> = new Future();
   private interruptedFuture: Future<void> = new Future();
+  // Whether the current segment has received a frame; cleared where a segment ends.
+  private segmentStarted: boolean = false;
   // playbackStarted fires once per segment; a mid-segment pause/resume does not re-arm this.
   private firstFrameEmitted: boolean = false;
   /** Gate held closed while the output is paused; frame forwarding awaits it. */
@@ -423,6 +425,17 @@ export class ParticipantAudioOutput extends AudioOutput {
   }
 
   async captureFrame(frame: AudioFrame): Promise<void> {
+    // An interruption ends the segment it was raised for. Carried into the next one, it makes
+    // the pause gate below drop that segment's frames instead of holding them, which reports
+    // the segment as fully played. Only a settled interruption is cleared: a pending one may
+    // still be awaited by the previous segment's playout.
+    if (!this.segmentStarted) {
+      this.segmentStarted = true;
+      if (this.interruptedFuture.done) {
+        this.interruptedFuture = new Future();
+      }
+    }
+
     await this.startedFuture.await;
 
     if (!this.playbackEnabledFuture.done) {
@@ -495,6 +508,7 @@ export class ParticipantAudioOutput extends AudioOutput {
    */
   flush(): void {
     super.flush();
+    this.segmentStarted = false;
 
     if (!this.pushedDuration) {
       return;
@@ -519,6 +533,11 @@ export class ParticipantAudioOutput extends AudioOutput {
         }
       })
       .catch(() => {});
+  }
+
+  abandonOpenSegment(): void {
+    super.abandonOpenSegment();
+    this.segmentStarted = false;
   }
 
   clearBuffer(): void {
