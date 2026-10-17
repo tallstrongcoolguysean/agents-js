@@ -161,6 +161,7 @@ describe('ParticipantAudioOutput captureFrame segment accounting', () => {
     startedFuture: Future<void>;
     playbackEnabledFuture: Future<void>;
     interruptedFuture: Future<void>;
+    segmentStarted: boolean;
     firstFrameEmitted: boolean;
     pushedDuration: number;
     _capturing: boolean;
@@ -181,6 +182,7 @@ describe('ParticipantAudioOutput captureFrame segment accounting', () => {
     output.playbackEnabledFuture = new Future<void>();
     if (!opts.paused) output.playbackEnabledFuture.resolve();
     output.interruptedFuture = new Future<void>();
+    output.segmentStarted = false;
     output.firstFrameEmitted = false;
     output.pushedDuration = 0;
     output._capturing = false;
@@ -209,6 +211,40 @@ describe('ParticipantAudioOutput captureFrame segment accounting', () => {
       new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 1000)),
     ]);
     expect(result).toBe('resolved');
+  });
+
+  for (const endSegment of ['flush', 'abandonOpenSegment'] as const) {
+    it(`holds a paused frame of the segment after an interrupted one (${endSegment})`, async () => {
+      const output = makeOutput({ paused: true });
+      // The previous segment was interrupted, and then it ended.
+      output.segmentStarted = true;
+      output.interruptedFuture.resolve();
+      output[endSegment]();
+
+      let captured = false;
+      const capture = output.captureFrame(frame()).then(() => {
+        captured = true;
+      });
+      await nextTick();
+      expect(captured).toBe(false);
+      expect(output.audioSource.captureFrame).not.toHaveBeenCalled();
+
+      output.resume();
+      await capture;
+      expect(output.audioSource.captureFrame).toHaveBeenCalledTimes(1);
+      expect(output.playbackSegmentsCount).toBe(1);
+    });
+  }
+
+  it('drops a paused frame when its own segment is interrupted', async () => {
+    const output = makeOutput({ paused: false });
+    await output.captureFrame(frame());
+
+    output.pause();
+    output.clearBuffer();
+    await output.captureFrame(frame());
+
+    expect(output.audioSource.captureFrame).toHaveBeenCalledTimes(1);
   });
 
   it('registers a segment on the normal non-paused path', async () => {
@@ -276,5 +312,135 @@ describe('ParticipantAudioOutput publishTrack', () => {
 
     expect(publishTrack).toHaveBeenCalledWith(fakeTrack, trackPublishOptions);
     expect(output.startedFuture.done).toBe(true);
+  });
+});
+
+describe('ParticipantAudioOutput reply after an interrupted reply', () => {
+  type TestOutput = ParticipantAudioOutput & {
+    startedFuture: Future<void>;
+    playbackEnabledFuture: Future<void>;
+    interruptedFuture: Future<void>;
+    segmentStarted: boolean;
+    firstFrameEmitted: boolean;
+    pushedDuration: number;
+    flushTask?: { result: Promise<void> };
+    _capturing: boolean;
+    playbackSegmentsCount: number;
+    playbackFinishedCount: number;
+    playbackFinishedFuture: Future<void>;
+    onPlaybackStarted: (createdAt: number) => void;
+    onPlaybackFinished: (event: { playbackPosition: number; interrupted: boolean }) => void;
+    audioSource: {
+      queuedDuration: number;
+      captureFrame: (frame: CaptureFrameArg) => Promise<void>;
+      clearQueue: () => void;
+      waitForPlayout: () => Promise<void>;
+    };
+  };
+
+  const frame = () => ({ samplesPerChannel: 480, sampleRate: 24000 }) as unknown as CaptureFrameArg;
+
+  // Playout waits for queued audio, and clearing the queue ends the wait, like rtc-node's source.
+  const makeOutput = () => {
+    let playout: Promise<void> | undefined;
+    let endPlayout: (() => void) | undefined;
+    const playOut = () => {
+      endPlayout?.();
+      playout = endPlayout = undefined;
+    };
+    const resolved = new Future<void>();
+    resolved.resolve();
+    const playing = new Future<void>();
+    playing.resolve();
+    const output = Object.create(ParticipantAudioOutput.prototype) as TestOutput;
+    Object.assign(output, {
+      startedFuture: resolved,
+      playbackEnabledFuture: playing,
+      interruptedFuture: new Future<void>(),
+      segmentStarted: false,
+      firstFrameEmitted: false,
+      pushedDuration: 0,
+      _capturing: false,
+      playbackSegmentsCount: 0,
+      playbackFinishedCount: 0,
+      playbackFinishedFuture: new Future<void>(),
+      onPlaybackStarted: vi.fn(),
+      onPlaybackFinished: vi.fn(),
+      audioSource: {
+        queuedDuration: 0,
+        captureFrame: vi.fn(async () => {
+          playout ??= new Promise<void>((resolve) => {
+            endPlayout = resolve;
+          });
+        }),
+        clearQueue: vi.fn(playOut),
+        waitForPlayout: () => playout ?? Promise.resolve(),
+      },
+    });
+    const lastFinish = () => vi.mocked(output.onPlaybackFinished).mock.calls.at(-1)?.[0];
+    return { output, playOut, lastFinish };
+  };
+
+  // The student talks over reply A and really interrupts it. The calls follow forwardAudio
+  // (generation.ts) and the agent's interruption: abort forwarding, then clear the buffer.
+  const interruptedReply = async (output: TestOutput) => {
+    output.resume();
+    await output.captureFrame(frame());
+    output.pause();
+    const held = output.captureFrame(frame());
+    output.clearBuffer();
+    await held;
+    output.flush();
+    output.clearBuffer();
+    await output.flushTask!.result;
+  };
+
+  // Reply B plays, then the student starts talking and the agent pauses it.
+  const pausedReply = async (output: TestOutput) => {
+    output.resume();
+    await output.captureFrame(frame());
+    output.pause();
+    let captured = false;
+    const held = output.captureFrame(frame()).then(() => {
+      captured = true;
+    });
+    await nextTick();
+    return { held, captured: () => captured };
+  };
+
+  it('reports the next reply interrupted when the student interrupts it while paused', async () => {
+    const { output, lastFinish } = makeOutput();
+    await interruptedReply(output);
+    expect(lastFinish()).toMatchObject({ interrupted: true });
+
+    const reply = await pausedReply(output);
+    // The pause holds the frame. Dropping it let forwarding finish as if the reply played out.
+    expect(reply.captured()).toBe(false);
+
+    output.clearBuffer();
+    await reply.held;
+    output.flush();
+    output.clearBuffer();
+    await output.flushTask!.result;
+
+    expect(lastFinish()).toMatchObject({ interrupted: true });
+    expect(output.audioSource.captureFrame).toHaveBeenCalledTimes(2);
+  });
+
+  it('plays the rest of the next reply after a false interruption', async () => {
+    const { output, playOut, lastFinish } = makeOutput();
+    await interruptedReply(output);
+
+    const reply = await pausedReply(output);
+    expect(reply.captured()).toBe(false);
+
+    output.resume();
+    await reply.held;
+    expect(output.audioSource.captureFrame).toHaveBeenCalledTimes(3);
+    output.flush();
+    playOut();
+    await output.flushTask!.result;
+
+    expect(lastFinish()).toMatchObject({ interrupted: false });
   });
 });
