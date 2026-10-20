@@ -15,6 +15,8 @@ export interface JobExecutor {
   initialize(): Promise<Throws<void, Error>>;
   close(): Promise<Throws<void, Error>>;
   launchJob(info: RunningJobInfo): Promise<Throws<void, Error>>;
+  /** Tells the running job that its worker is draining. Never throws. */
+  notifyDraining?(): void;
 }
 
 export enum JobStatus {

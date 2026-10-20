@@ -135,6 +135,8 @@ export class JobContext<ProcessUserData = Record<string, unknown>> {
   } = {};
   #logger: Logger;
   #inferenceExecutor: InferenceExecutor;
+  #draining = false;
+  #drainingCallbacks = new Set<() => void | Promise<void>>();
 
   /** @internal */
   _primaryAgentSession?: AgentSession;
@@ -270,6 +272,56 @@ export class JobContext<ProcessUserData = Record<string, unknown>> {
   /** Adds a promise to be awaited when {@link JobContext.shutdown | shutdown} is called. */
   addShutdownCallback(callback: () => Promise<void>) {
     this.shutdownCallbacks.push(callback);
+  }
+
+  /**
+   * True once the worker running this job has started draining. The job keeps
+   * running; the process is killed when the platform's grace period runs out.
+   */
+  get isDraining(): boolean {
+    return this.#draining;
+  }
+
+  /**
+   * Calls `callback` once when the worker running this job starts draining, so
+   * the job can wrap up or hand its session off before the process is killed.
+   * A callback registered after the drain began runs on the next tick.
+   *
+   * @returns A function that removes the callback.
+   */
+  onDraining(callback: () => void | Promise<void>): () => void {
+    if (this.#draining) {
+      queueMicrotask(() => this.#runDrainingCallback(callback));
+      return () => {};
+    }
+    this.#drainingCallbacks.add(callback);
+    return () => {
+      this.#drainingCallbacks.delete(callback);
+    };
+  }
+
+  /** @internal Called by the job process when the worker sends its drain notice. */
+  _markDraining() {
+    if (this.#draining) {
+      return;
+    }
+    this.#draining = true;
+    this.#logger.info('worker is draining');
+    const callbacks = [...this.#drainingCallbacks];
+    this.#drainingCallbacks.clear();
+    for (const callback of callbacks) {
+      this.#runDrainingCallback(callback);
+    }
+  }
+
+  #runDrainingCallback(callback: () => void | Promise<void>) {
+    try {
+      void Promise.resolve(callback()).catch((error) => {
+        this.#logger.error({ error }, 'error in draining callback');
+      });
+    } catch (error) {
+      this.#logger.error({ error }, 'error in draining callback');
+    }
   }
 
   async waitForParticipant(identity?: string): Promise<RemoteParticipant> {
