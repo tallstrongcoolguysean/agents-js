@@ -279,3 +279,61 @@ describe('JobContext telemetry metadata', () => {
     expect(ctx._otelMetadata()).toEqual({ 'lk.simulation.enabled': true });
   });
 });
+
+describe('JobContext.onDraining', () => {
+  it('runs every registered callback once when the worker starts draining', () => {
+    const ctx = createJobContext();
+    const first = vi.fn();
+    const second = vi.fn();
+    ctx.onDraining(first);
+    ctx.onDraining(second);
+
+    expect(ctx.isDraining).toBe(false);
+    ctx._markDraining();
+    ctx._markDraining();
+
+    expect(ctx.isDraining).toBe(true);
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(second).toHaveBeenCalledTimes(1);
+  });
+
+  it('skips a callback that was removed before the drain', () => {
+    const ctx = createJobContext();
+    const callback = vi.fn();
+    const remove = ctx.onDraining(callback);
+
+    remove();
+    ctx._markDraining();
+
+    expect(callback).not.toHaveBeenCalled();
+  });
+
+  it('runs a callback registered after the drain began on the next tick', async () => {
+    const ctx = createJobContext();
+    ctx._markDraining();
+    const callback = vi.fn();
+
+    ctx.onDraining(callback);
+    expect(callback).not.toHaveBeenCalled();
+    await Promise.resolve();
+
+    expect(callback).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps calling later callbacks when one throws or rejects', async () => {
+    const ctx = createJobContext();
+    const after = vi.fn();
+    ctx.onDraining(() => {
+      throw new Error('sync failure');
+    });
+    ctx.onDraining(async () => {
+      throw new Error('async failure');
+    });
+    ctx.onDraining(after);
+
+    expect(() => ctx._markDraining()).not.toThrow();
+    await Promise.resolve();
+
+    expect(after).toHaveBeenCalledTimes(1);
+  });
+});

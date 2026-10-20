@@ -532,6 +532,14 @@ export class AgentServer {
       }),
     );
 
+    // A running job is otherwise never told its worker is going away, so it
+    // cannot hand its session off before the platform kills the process.
+    for (const proc of this.#procPool.processes) {
+      if (proc.runningJob) {
+        proc.notifyDraining?.();
+      }
+    }
+
     const joinJobs = async (): Promise<Throws<void[], Error>> => {
       return ThrowsPromise.all(
         this.#procPool.processes.map((proc): Promise<Throws<void, Error>> => {
@@ -872,6 +880,11 @@ export class AgentServer {
             apiKey: this.#opts.apiKey,
             apiSecret: this.#opts.apiSecret,
           });
+          // Accepted before the drain began but launched after it: the drain
+          // loop could not see this job, so it gets its notice here.
+          if (this.#draining) {
+            this.#procPool.getByJobId(msg.job!.id)?.notifyDraining?.();
+          }
         } catch (e) {
           this.#logger.child({ requestId: req.id }).error(e, 'error launching job');
         }

@@ -325,6 +325,14 @@ const startJob = (
           logger.debug('job started');
           break;
         }
+        case 'drainRequest': {
+          if (job) {
+            job.ctx._markDraining();
+          } else {
+            logger.debug('drain notice arrived before a job started; ignoring');
+          }
+          break;
+        }
         case 'shutdownRequest': {
           if (!job) {
             join.resolve();

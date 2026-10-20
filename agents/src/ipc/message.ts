@@ -35,6 +35,11 @@ export type IPCMessage =
       value: { reason?: string };
     }
   | {
+      /** The worker stopped taking jobs; the running job keeps going until it ends itself. */
+      case: 'drainRequest';
+      value: undefined;
+    }
+  | {
       case: 'inferenceRequest';
       value: { method: string; requestId: string; data: unknown };
     }

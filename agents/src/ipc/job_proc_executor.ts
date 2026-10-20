@@ -123,4 +123,19 @@ export class JobProcExecutor extends SupervisedProc implements JobExecutor {
 
     this.proc!.send({ case: 'startJobRequest', value: { runningJob: info } });
   }
+
+  notifyDraining() {
+    if (!this.#runningJob || !this.proc?.connected) {
+      return;
+    }
+    const onSendError = (error: Error | null) => {
+      if (error) this.#logger.debug({ error }, 'failed to notify job of drain');
+    };
+    try {
+      this.proc.send({ case: 'drainRequest', value: undefined }, onSendError);
+    } catch (error) {
+      // The job may be exiting on its own; draining must not depend on this notice.
+      this.#logger.debug({ error }, 'failed to notify job of drain');
+    }
+  }
 }
